@@ -8,6 +8,7 @@ Servicio OpenAPI para procesar documentos PDF (OCR, chunking y embeddings) desde
 - El `documento_id` real se resuelve internamente en `GestorDocumental.Documentos` por `metadatosExtra.ocr.metadata.oid` y fallback por `archivoNombre`.
 - Si se envia `nombre_documento`, no se consulta el nombre en `ItemsIngestaSmb` por OID.
 - Al terminar OCR+limpieza, el servicio actualiza `GestorDocumental.Documentos.contenidoTexto`.
+- El response incluye `ocr_quality` y `ocr_confidence` (detalle de confianza OCR).
 
 ## Endpoints por proceso
 
