@@ -136,6 +136,7 @@ Retorno esperado (resumen):
 ## Estados y errores
 
 - `status`: `COMPLETED`, `ENQUEUED`, `FAILED`.
+- Si una solicitud falla, la API responde HTTP `403` con detalle completo (`phase`, `code`, `traceback`, `phases`).
 - Errores comunes:
   - `OID_READ_FAILED`
   - `EMPTY_BINARY`

@@ -13,6 +13,8 @@ Descripcion de que hace cada parametro en el payload `input`.
 - Si no logra resolver `documento_id`, persiste con `documentoId=null` (si el esquema lo permite) y deja traza en fases.
 - Si no se envia: `422`.
 - Nota operativa: cuando se resuelve `documento_id`, el OCR limpio se escribe en `GestorDocumental.Documentos.contenidoTexto`.
+- Al finalizar OCR se actualiza `ocrAplicado=true` y `estado=EN_PROCESAMIENTO`.
+- Al finalizar embeddings/chunking (etapas con embeddings) se actualiza `embeddingGenerado=true`, `estado=PROCESADO` y `metadatosExtra`.
 
 ## `nombre_documento`
 - Tipo: `string`.
@@ -175,6 +177,7 @@ Descripcion de que hace cada parametro en el payload `input`.
 ## Estado y errores de salida
 
 - `status`: `COMPLETED`, `ENQUEUED`, `FAILED`.
+- Errores HTTP: la API retorna `403` con detalle completo cuando hay falla de request o pipeline.
 - `error`: `{ phase, code, message, details }`.
 - Codigos frecuentes:
   - `OID_READ_FAILED`
