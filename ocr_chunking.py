@@ -3,7 +3,7 @@ OCR + chunking + embeddings orchestrator (FastAPI/OpenAPI, psycopg2, no plpy).
 
 Main goals:
 - Single service file at project root.
-- Required input: oid (PostgreSQL Large Object OID del PDF).
+- Required input: oid (PostgreSQL Large Object OID del archivo).
 - Full document processing or first/last N pages.
 - Queue + overwrite policies with clear and traceable states.
 - Docling OCR, semantic/simple chunking, embedding generation, DB persistence.
@@ -44,7 +44,7 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.types.doc import DocItemLabel, DoclingDocument
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from psycopg2.extras import RealDictCursor, execute_batch
 from transformers import AutoModel, AutoTokenizer
@@ -63,7 +63,7 @@ OPENAPI_TAGS = [
     {"name": TAG_EMBEDDING, "description": "Metodos de generacion de embeddings."},
     {"name": TAG_OCR, "description": "Metodos de OCR y extraccion de texto."},
     {"name": TAG_PIPELINE, "description": "Metodos de orquestacion completa PipelineOCR."},
-    {"name": TAG_HELPERS, "description": "Endpoints auxiliares: health, example-request, validate-db."},
+    {"name": TAG_HELPERS, "description": "Endpoints auxiliares: auth/login, health, example-request, validate-db."},
 ]
 
 DEFAULT_QUEUE_NAME = "BRAINVT_OCR_EMBEDDINGS_GPU"
@@ -72,11 +72,76 @@ DEFAULT_CREATED_BY = 1101
 DEFAULT_TIMEOUT_SECONDS = 1800
 DEFAULT_PROBE_MAX_PAGES = 60
 DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
+DEFAULT_AUTH_USERNAME = "ANHAuthUser2026"
+DEFAULT_AUTH_PASSWORD = "%4;=q[{/,{vj%8V65SyLoj]>wn"
+DEFAULT_AUTH_FIXED_TOKEN = "6d87ccd5-473f-4464-81ec-e7aaaea99c93"
 SERVICE_STAGE_ENDPOINTS = {
     "ocr": "/ocr-docling/process",
     "chunking": "/chunking-docling/process",
     "embedding": "/embedding-generation/process",
     "pipeline": "/PipelineOCR/process",
+}
+SUPPORTED_DOCLING_MIME_TYPES = {
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "text/markdown",
+    "text/x-markdown",
+    "text/asciidoc",
+    "text/x-asciidoc",
+    "text/x-tex",
+    "application/x-latex",
+    "text/html",
+    "application/xhtml+xml",
+    "text/csv",
+    "image/png",
+    "image/jpeg",
+    "image/tiff",
+    "image/bmp",
+    "image/webp",
+}
+MIME_TO_EXTENSION = {
+    "application/pdf": ".pdf",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "text/markdown": ".md",
+    "text/x-markdown": ".md",
+    "text/asciidoc": ".adoc",
+    "text/x-asciidoc": ".adoc",
+    "text/x-tex": ".tex",
+    "application/x-latex": ".tex",
+    "text/html": ".html",
+    "application/xhtml+xml": ".xhtml",
+    "text/csv": ".csv",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/tiff": ".tiff",
+    "image/bmp": ".bmp",
+    "image/webp": ".webp",
+}
+EXTENSION_TO_MIME = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".md": "text/markdown",
+    ".markdown": "text/markdown",
+    ".adoc": "text/asciidoc",
+    ".asciidoc": "text/asciidoc",
+    ".tex": "text/x-tex",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".xhtml": "application/xhtml+xml",
+    ".csv": "text/csv",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".bmp": "image/bmp",
+    ".webp": "image/webp",
 }
 
 PAGE_INDICATOR_PATTERN = re.compile(
@@ -149,14 +214,6 @@ def safe_bool(value: Any, default: bool = False) -> bool:
     return bool(default)
 
 
-def safe_len(value: Any) -> int:
-    """Safe len conversion."""
-    try:
-        return int(len(value))
-    except Exception:
-        return 0
-
-
 def to_json_dict(value: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Converts value to dict when possible."""
     if default is None:
@@ -212,6 +269,52 @@ def normalize_file_name(value: Any) -> str:
     if not raw:
         return ""
     return os.path.basename(raw.replace("\\", "/")).strip()
+
+
+def normalize_mime_type(value: Any) -> str:
+    """Normaliza mime type a minusculas, sin parametros."""
+    raw = safe_str(value, "").strip().lower()
+    if not raw:
+        return ""
+    if ";" in raw:
+        raw = raw.split(";", 1)[0].strip()
+    return raw
+
+
+def infer_mime_type_from_file_name(file_name: str) -> str:
+    """Infiere mime type por extension de archivo."""
+    normalized = normalize_file_name(file_name)
+    if not normalized:
+        return ""
+    _, ext = os.path.splitext(normalized)
+    return EXTENSION_TO_MIME.get(ext.lower(), "")
+
+
+def resolve_request_mime_type(
+    request_mime_type: Optional[str],
+    request_metadata: Dict[str, Any],
+    documento_info: Optional[Dict[str, Any]],
+    file_name: str,
+) -> str:
+    """Resuelve mime type desde request, metadata, documento y extension."""
+    candidate = normalize_mime_type(request_mime_type)
+    if candidate:
+        return candidate
+    candidate = normalize_mime_type(request_metadata.get("mime_type"))
+    if candidate:
+        return candidate
+    candidate = normalize_mime_type(request_metadata.get("mimeType"))
+    if candidate:
+        return candidate
+    candidate = normalize_mime_type((documento_info or {}).get("archivo_mime_type"))
+    if candidate:
+        return candidate
+    return normalize_mime_type(infer_mime_type_from_file_name(file_name))
+
+
+def is_supported_docling_mime(mime_type: str) -> bool:
+    """Valida si mime type esta soportado por el servicio Docling actual."""
+    return normalize_mime_type(mime_type) in SUPPORTED_DOCLING_MIME_TYPES
 
 
 def pydantic_model_dump(model: BaseModel) -> Dict[str, Any]:
@@ -305,6 +408,26 @@ class PostgresSettings:
             dbname=os.getenv("OCR_DB_NAME", "niledb"),
             user=os.getenv("OCR_DB_USER", "postgres"),
             password=os.getenv("OCR_DB_PASSWORD", "plexia"),
+        )
+
+
+@dataclass
+class AuthSettings:
+    """Auth settings for API access control."""
+
+    enabled: bool
+    username: str
+    password: str
+    fixed_token: str
+
+    @staticmethod
+    def from_env() -> "AuthSettings":
+        """Loads auth settings from environment."""
+        return AuthSettings(
+            enabled=safe_bool(os.getenv("OCR_AUTH_ENABLED", "true"), True),
+            username=safe_str(os.getenv("OCR_AUTH_USER", DEFAULT_AUTH_USERNAME), DEFAULT_AUTH_USERNAME),
+            password=safe_str(os.getenv("OCR_AUTH_PASSWORD", DEFAULT_AUTH_PASSWORD), DEFAULT_AUTH_PASSWORD),
+            fixed_token=safe_str(os.getenv("OCR_FIXED_TOKEN", DEFAULT_AUTH_FIXED_TOKEN), DEFAULT_AUTH_FIXED_TOKEN),
         )
 
 
@@ -483,7 +606,11 @@ class PostgresClient:
         SELECT
           d."id"           AS documento_id,
           d."archivoNombre" AS archivo_nombre,
+          d."archivoMimeType" AS archivo_mime_type,
+          d."contenidoHash" AS contenido_hash,
           d."estado"        AS estado_documento,
+          d."procesado"     AS procesado,
+          d."embeddingGenerado" AS embedding_generado,
           d."createdBy"     AS created_by,
           d."updatedAt"     AS updated_at
         FROM "GestorDocumental"."Documentos" d
@@ -501,7 +628,11 @@ class PostgresClient:
             SELECT
               d."id"            AS documento_id,
               d."archivoNombre" AS archivo_nombre,
+              d."archivoMimeType" AS archivo_mime_type,
+              d."contenidoHash" AS contenido_hash,
               d."estado"        AS estado_documento,
+              d."procesado"     AS procesado,
+              d."embeddingGenerado" AS embedding_generado,
               d."createdBy"     AS created_by,
               d."updatedAt"     AS updated_at
             FROM "GestorDocumental"."Documentos" d
@@ -520,7 +651,11 @@ class PostgresClient:
         SELECT
           d."id"            AS documento_id,
           d."archivoNombre" AS archivo_nombre,
+          d."archivoMimeType" AS archivo_mime_type,
+          d."contenidoHash" AS contenido_hash,
           d."estado"        AS estado_documento,
+          d."procesado"     AS procesado,
+          d."embeddingGenerado" AS embedding_generado,
           d."createdBy"     AS created_by,
           d."updatedAt"     AS updated_at
         FROM "GestorDocumental"."Documentos" d
@@ -624,6 +759,82 @@ class PostgresClient:
             (
                 safe_str(estado, "PROCESADO"),
                 json_dumps_safe(metadata_patch),
+                safe_int(updated_by, None),
+                int(documento_id),
+            ),
+        )
+
+    def count_processed_documents_by_hash(
+        self,
+        contenido_hash: str,
+        exclude_documento_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Cuenta documentos PROCESADOS con mismo hash."""
+        sql = """
+        SELECT
+          COUNT(*)::int AS total,
+          COALESCE(jsonb_agg(d."id") FILTER (WHERE d."id" IS NOT NULL), '[]'::jsonb) AS documento_ids
+        FROM "GestorDocumental"."Documentos" d
+        WHERE COALESCE(d."contenidoHash",'') = %s
+          AND (%s::int IS NULL OR d."id" <> %s::int)
+          AND (
+            upper(COALESCE(d."estado"::text, '')) = 'PROCESADO'
+            OR COALESCE(d."procesado", false) = true
+          )
+        """
+        row = self.query_one(
+            sql,
+            (
+                safe_str(contenido_hash, ""),
+                safe_int(exclude_documento_id, None),
+                safe_int(exclude_documento_id, None),
+            ),
+        )
+        if not row:
+            return {"total": 0, "documento_ids": []}
+        return {
+            "total": safe_int(row.get("total"), 0) or 0,
+            "documento_ids": to_json_safe(row.get("documento_ids") or []),
+        }
+
+    def mark_documento_pending_processing(
+        self,
+        documento_id: int,
+        updated_by: Optional[int],
+        error_code: str,
+        error_message: str,
+        mime_type: Optional[str],
+    ) -> Optional[Dict[str, Any]]:
+        """Marca documento en PENDIENTE_PROCESAMIENTO con detalle de error."""
+        patch = {
+            "ocr_embedding_pipeline": {
+                "last_error": {
+                    "code": safe_str(error_code, ""),
+                    "message": safe_str(error_message, ""),
+                    "mime_type": normalize_mime_type(mime_type),
+                    "timestamp_utc": utc_now_iso(),
+                },
+                "estado_documento": "PENDIENTE_PROCESAMIENTO",
+            }
+        }
+        sql = """
+        UPDATE "GestorDocumental"."Documentos"
+        SET
+          "estado" = 'PENDIENTE_PROCESAMIENTO',
+          "metadatosExtra" = COALESCE("metadatosExtra"::jsonb, '{}'::jsonb) || %s::jsonb,
+          "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'),
+          "updatedBy" = COALESCE(%s, "updatedBy")
+        WHERE "id" = %s
+        RETURNING
+          "id" AS documento_id,
+          "archivoNombre" AS archivo_nombre,
+          "estado" AS estado_documento,
+          "updatedAt" AS updated_at
+        """
+        return self.execute_returning_one(
+            sql,
+            (
+                json_dumps_safe(patch),
                 safe_int(updated_by, None),
                 int(documento_id),
             ),
@@ -897,11 +1108,19 @@ class QueueOptions(BaseModel):
 
 
 class OverwriteOptions(BaseModel):
-    """Overwrite options for duplicate embeddings (siempre a nivel documento)."""
+    """Overwrite/guard options for embeddings y reproceso documental."""
 
     enabled: bool = Field(
         default=False,
         description="Si true, borra embeddings existentes del documento antes de insertar.",
+    )
+    allow_duplicate_hash: bool = Field(
+        default=False,
+        description="Permite procesar documentos aunque exista otro PROCESADO con mismo contenidoHash.",
+    )
+    allow_reprocess_processed: bool = Field(
+        default=False,
+        description="Permite reprocesar documento cuando estado actual es PROCESADO.",
     )
 
 
@@ -981,7 +1200,7 @@ class OCRChunkingRequest(BaseModel):
     oid: int = Field(
         ...,
         description=(
-            "OID del Large Object (pg_largeobject) del PDF a procesar. "
+            "OID del Large Object (pg_largeobject) del archivo a procesar. "
             "El documentoId de GestorDocumental se resuelve internamente por metadata/nombre."
         ),
     )
@@ -992,6 +1211,10 @@ class OCRChunkingRequest(BaseModel):
     file_name: Optional[str] = Field(
         default=None,
         description="Alias opcional de nombre_documento para compatibilidad.",
+    )
+    mime_type: Optional[str] = Field(
+        default=None,
+        description="Mime type esperado del archivo, por ejemplo application/pdf.",
     )
     job_filde_id: Optional[int] = Field(
         default=None,
@@ -1027,6 +1250,7 @@ class OCRChunkingRequest(BaseModel):
                 "oid": 2299268,
                 "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
                 "file_name": None,
+                "mime_type": "application/pdf",
                 "job_filde_id": 4567,
                 "usuario_proceso": "analista_anh",
                 "job_proceso": "JOB_OCR_20260309_001",
@@ -1041,7 +1265,7 @@ class OCRChunkingRequest(BaseModel):
                     "max_concurrency": 2,
                     "queue_when_busy": True,
                 },
-                "overwrite": {"enabled": False},
+                "overwrite": {"enabled": False, "allow_duplicate_hash": False, "allow_reprocess_processed": False},
                 "extraction": {
                     "engine": "auto",
                     "enable_pymupdf_fast_path": True,
@@ -1139,6 +1363,18 @@ def load_docling_converter(force_full_page_ocr: bool, do_table_structure: bool, 
         if hasattr(options, "ocr_options") and options.ocr_options is not None:
             setattr(options.ocr_options, "force_full_page_ocr", bool(force_full_page_ocr))
         converter = DocumentConverter(format_options={"pdf": PdfFormatOption(pipeline_options=options)})
+        _DOCLING_CONVERTER_CACHE[key] = converter
+        return converter
+
+
+def load_docling_converter_generic() -> Any:
+    """Loads generic Docling converter (no formato fijo)."""
+    key = "GENERIC_DEFAULT"
+    with _DOCLING_LOCK:
+        cached = _DOCLING_CONVERTER_CACHE.get(key)
+        if cached is not None:
+            return cached
+        converter = DocumentConverter()
         _DOCLING_CONVERTER_CACHE[key] = converter
         return converter
 
@@ -1265,163 +1501,56 @@ def extraer_confianza_docling(confidence_obj: Any) -> Dict[str, Any]:
     }
 
 
-def _resolve_docling_page_obj(document: Any, page_idx: int) -> Any:
-    """Resuelve objeto de pagina Docling para un indice 1-based."""
-    if document is None:
-        return None
-    pages = getattr(document, "pages", None)
-    if isinstance(pages, list) and pages:
-        pos = max(0, min(int(page_idx) - 1, len(pages) - 1))
-        return pages[pos]
-    if isinstance(pages, dict) and pages:
-        direct = pages.get(page_idx)
-        if direct is not None:
-            return direct
-        as_str = pages.get(safe_str(page_idx, ""))
-        if as_str is not None:
-            return as_str
-        values = list(pages.values())
-        if values:
-            pos = max(0, min(int(page_idx) - 1, len(values) - 1))
-            return values[pos]
-    return None
-
-
-def _extraer_metadata_pagina_docling(page_result: Any, pagina: int) -> Dict[str, Any]:
-    """Extrae metadata de una pagina incluyendo confianza e indicadores basicos."""
-    document = getattr(page_result, "document", None)
-    page_obj = _resolve_docling_page_obj(document, pagina)
-    size_obj = getattr(page_obj, "size", None) if page_obj is not None else None
-    confianza = extraer_confianza_docling(getattr(page_result, "confidence", None))
-    return {
-        "pagina": int(pagina),
-        "status_conversion": safe_str(getattr(page_result, "status", "UNKNOWN"), "UNKNOWN"),
-        "confianza_media_pagina": safe_float(confianza.get("mean_score"), None)
-        if isinstance(confianza, dict)
-        else None,
-        "confianza": confianza,
-        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
-        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
-        "rotacion": safe_float(getattr(page_obj, "angle", None), None) if page_obj is not None else None,
-        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
-        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
-        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
-    }
-
-
 def extract_docling_confidence_bundle(result: Any) -> Dict[str, Any]:
-    """Extrae confianza global y por pagina de Docling cuando esta disponible."""
+    """Extrae confianza global/sintetica de Docling (sin detalle pagina a pagina)."""
     global_conf = extraer_confianza_docling(getattr(result, "confidence", None))
-    page_entries: List[Dict[str, Any]] = []
-
-    result_pages = getattr(result, "pages", None)
-    if isinstance(result_pages, list) and result_pages:
-        for idx, page_result in enumerate(result_pages, start=1):
-            page_num = safe_int(getattr(page_result, "page_no", None), None)
-            if page_num is None:
-                page_num = safe_int(getattr(page_result, "page_number", None), idx)
-            page_entries.append(_extraer_metadata_pagina_docling(page_result, int(page_num or idx)))
-    elif isinstance(result_pages, dict) and result_pages:
-        sorted_items = sorted(result_pages.items(), key=lambda kv: safe_int(kv[0], 999999999))
-        for idx, (key, page_result) in enumerate(sorted_items, start=1):
-            page_num = safe_int(key, idx) or idx
-            page_entries.append(_extraer_metadata_pagina_docling(page_result, int(page_num)))
+    document = getattr(result, "document", None)
+    doc_pages = getattr(document, "pages", None)
+    if isinstance(doc_pages, dict):
+        total_pages = len(doc_pages.keys())
+    elif isinstance(doc_pages, list):
+        total_pages = len(doc_pages)
     else:
-        # Fallback cuando Docling no expose pages en el resultado.
-        document = getattr(result, "document", None)
-        doc_pages = getattr(document, "pages", None)
-        if isinstance(doc_pages, list) and doc_pages:
-            for idx, page_obj in enumerate(doc_pages, start=1):
-                conf = extraer_confianza_docling(getattr(page_obj, "confidence", None))
-                size_obj = getattr(page_obj, "size", None)
-                page_entries.append(
-                    {
-                        "pagina": int(idx),
-                        "status_conversion": safe_str(getattr(result, "status", "UNKNOWN"), "UNKNOWN"),
-                        "confianza_media_pagina": safe_float(conf.get("mean_score"), None),
-                        "confianza": conf,
-                        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
-                        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
-                        "rotacion": safe_float(getattr(page_obj, "angle", None), None),
-                        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
-                        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
-                        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
-                    }
-                )
-        elif isinstance(doc_pages, dict) and doc_pages:
-            sorted_items = sorted(doc_pages.items(), key=lambda kv: safe_int(kv[0], 999999999))
-            for idx, (key, page_obj) in enumerate(sorted_items, start=1):
-                page_num = safe_int(key, idx) or idx
-                conf = extraer_confianza_docling(getattr(page_obj, "confidence", None))
-                size_obj = getattr(page_obj, "size", None)
-                page_entries.append(
-                    {
-                        "pagina": int(page_num),
-                        "status_conversion": safe_str(getattr(result, "status", "UNKNOWN"), "UNKNOWN"),
-                        "confianza_media_pagina": safe_float(conf.get("mean_score"), None),
-                        "confianza": conf,
-                        "ancho": safe_float(getattr(size_obj, "width", None), None) if size_obj is not None else None,
-                        "alto": safe_float(getattr(size_obj, "height", None), None) if size_obj is not None else None,
-                        "rotacion": safe_float(getattr(page_obj, "angle", None), None),
-                        "items_texto_detectados": safe_len(getattr(document, "texts", None)),
-                        "tablas_detectadas": safe_len(getattr(document, "tables", None)),
-                        "imagenes_detectadas": safe_len(getattr(document, "pictures", None)),
-                    }
-                )
-
-    mean_scores: List[float] = []
-    ocr_scores: List[float] = []
-    for page_meta in page_entries:
-        conf = page_meta.get("confianza")
-        if not isinstance(conf, dict):
-            continue
-        mean_value = safe_float(conf.get("mean_score"), None)
-        if mean_value is not None:
-            mean_scores.append(float(mean_value))
-        ocr_value = safe_float(conf.get("ocr_score"), None)
-        if ocr_value is not None:
-            ocr_scores.append(float(ocr_value))
-
+        total_pages = 0
     summary = {
-        "pages_total": len(page_entries),
-        "pages_with_confidence": len([p for p in page_entries if safe_bool((p.get("confianza") or {}).get("disponible"), False)]),
-        "mean_score_avg": round(sum(mean_scores) / len(mean_scores), 6) if mean_scores else None,
-        "ocr_score_avg": round(sum(ocr_scores) / len(ocr_scores), 6) if ocr_scores else None,
+        "pages_total": int(total_pages),
         "global_mean_score": safe_float(global_conf.get("mean_score"), None),
         "global_ocr_score": safe_float(global_conf.get("ocr_score"), None),
     }
     selected_quality = (
-        summary["mean_score_avg"]
-        if summary["mean_score_avg"] is not None
-        else summary["global_mean_score"]
+        summary["global_mean_score"]
+        if summary["global_mean_score"] is not None
+        else summary["global_ocr_score"]
     )
-    if selected_quality is None:
-        selected_quality = (
-            summary["ocr_score_avg"]
-            if summary["ocr_score_avg"] is not None
-            else summary["global_ocr_score"]
-        )
     summary["selected_quality"] = selected_quality
 
     return {
         "global": global_conf,
-        "pages": page_entries,
         "summary": summary,
-        "disponible": bool(page_entries or safe_bool(global_conf.get("disponible"), False)),
+        "disponible": safe_bool(global_conf.get("disponible"), False),
     }
 
 
-def extract_text_docling(pdf_bytes: bytes, extraction: ExtractionOptions) -> Tuple[str, int, Dict[str, Any]]:
-    """Extracts OCR text with Docling."""
-    converter = load_docling_converter(
-        force_full_page_ocr=bool(extraction.force_full_page_ocr),
-        do_table_structure=bool(extraction.do_table_structure),
-        images_scale=float(extraction.images_scale),
-    )
+def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mime_type: str, file_name: str) -> Tuple[str, int, Dict[str, Any]]:
+    """Extracts text/OCR with Docling for supported mime types."""
+    normalized_mime = normalize_mime_type(mime_type)
+    is_pdf = normalized_mime == "application/pdf"
+    if is_pdf:
+        converter = load_docling_converter(
+            force_full_page_ocr=bool(extraction.force_full_page_ocr),
+            do_table_structure=bool(extraction.do_table_structure),
+            images_scale=float(extraction.images_scale),
+        )
+    else:
+        converter = load_docling_converter_generic()
 
-    temp = tempfile.NamedTemporaryFile(prefix="docling_ocr_", suffix=".pdf", delete=False)
+    suffix = MIME_TO_EXTENSION.get(normalized_mime)
+    if not suffix:
+        _, ext = os.path.splitext(normalize_file_name(file_name))
+        suffix = ext if ext else ".bin"
+    temp = tempfile.NamedTemporaryFile(prefix="docling_ocr_", suffix=suffix, delete=False)
     temp_path = temp.name
-    temp.write(pdf_bytes)
+    temp.write(binary_bytes)
     temp.flush()
     temp.close()
     try:
@@ -1451,7 +1580,8 @@ def extract_text_docling(pdf_bytes: bytes, extraction: ExtractionOptions) -> Tup
         confidence_bundle = extract_docling_confidence_bundle(result)
         return text.strip(), page_count, {
             "conversion_status": status_str,
-            "conversion_mode": "docling_ocr",
+            "conversion_mode": "docling_ocr" if is_pdf else "docling_extract",
+            "mime_type": normalized_mime,
             "docling_confidence": confidence_bundle,
             "ocr_quality": safe_float((confidence_bundle.get("summary") or {}).get("selected_quality"), None),
         }
@@ -1783,6 +1913,7 @@ def derive_embedding_max_length(chunking: ChunkingOptions) -> int:
 def build_job_payload(
     request: OCRChunkingRequest,
     file_name: str,
+    mime_type: str,
     item_info: Optional[Dict[str, Any]],
     documento_info: Optional[Dict[str, Any]],
     stage: str,
@@ -1796,11 +1927,14 @@ def build_job_payload(
         "oid_documento": int(request.oid),
         "documento_id_real": documento_id_real,
         "file_name": file_name,
+        "mime_type": mime_type,
         "usuario_proceso": request.usuario_proceso,
         "job_proceso": request.job_proceso,
         "job_filde_id": request.job_filde_id,
         "queue_name": DEFAULT_QUEUE_NAME,
         "overwrite_enabled": request.overwrite.enabled,
+        "allow_duplicate_hash": request.overwrite.allow_duplicate_hash,
+        "allow_reprocess_processed": request.overwrite.allow_reprocess_processed,
         "metadata": request.metadata,
         "resolved_item": to_json_safe(item_info or {}),
         "resolved_documento": to_json_safe(documento_info or {}),
@@ -1912,6 +2046,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     documento_info: Optional[Dict[str, Any]] = None
     oid_stats: Optional[Dict[str, Any]] = None
     file_name = normalize_file_name(request.nombre_documento or request.file_name)
+    mime_type = normalize_mime_type(request.mime_type)
+    mime_support_info: Dict[str, Any] = {}
     documento_id: Optional[int] = None
 
     recorder.push("REQUEST_VALIDATION", "OK", "Request recibida.", {"oid": int(request.oid), "stage": stage_key})
@@ -2012,7 +2148,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         },
                     )
                 if not file_name:
-                    file_name = f"documento_{int(request.oid)}.pdf"
+                    file_name = f"documento_{int(request.oid)}.bin"
                     recorder.push(
                         "LOAD_ITEM",
                         "WARN",
@@ -2062,6 +2198,54 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     {"oid": int(request.oid)},
                 )
 
+            # Reproceso de documento en estado PROCESADO.
+            if documento_id is not None:
+                estado_actual = safe_str((documento_info or {}).get("estado_documento"), "").strip().upper()
+                if estado_actual == "PROCESADO" and not request.overwrite.allow_reprocess_processed:
+                    raise PipelineError(
+                        "DOCUMENT_GUARD",
+                        "DOCUMENT_ALREADY_PROCESSED",
+                        "El documento ya esta en estado PROCESADO y allow_reprocess_processed=false.",
+                        {
+                            "documento_id": documento_id,
+                            "estado_documento": estado_actual,
+                            "allow_reprocess_processed": bool(request.overwrite.allow_reprocess_processed),
+                        },
+                    )
+
+            mime_type = resolve_request_mime_type(
+                request_mime_type=request.mime_type,
+                request_metadata=request.metadata,
+                documento_info=documento_info,
+                file_name=file_name,
+            )
+            mime_support_info = {
+                "mime_type": mime_type,
+                "supported": is_supported_docling_mime(mime_type),
+                "supported_list": sorted(SUPPORTED_DOCLING_MIME_TYPES),
+            }
+            if not mime_support_info["supported"]:
+                if documento_id is not None:
+                    updated_by_guard = (
+                        request.created_by
+                        if request.created_by is not None
+                        else request.embedding.created_by_default
+                    )
+                    db.mark_documento_pending_processing(
+                        documento_id=documento_id,
+                        updated_by=updated_by_guard,
+                        error_code="UNSUPPORTED_MIME_TYPE",
+                        error_message=f"Mime type no soportado: {mime_type}",
+                        mime_type=mime_type,
+                    )
+                raise PipelineError(
+                    "MIME_VALIDATION",
+                    "UNSUPPORTED_MIME_TYPE",
+                    "Mime type no soportado para procesamiento OCR/Docling.",
+                    mime_support_info,
+                )
+            recorder.push("MIME_VALIDATION", "OK", "Mime type validado.", mime_support_info)
+
             if request.queue.enabled:
                 queue_info = db.ensure_queue(
                     queue_name=queue_name,
@@ -2075,7 +2259,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             else:
                 recorder.push("QUEUE_SETUP", "SKIPPED", "Queue deshabilitada.")
 
-            payload = build_job_payload(request, file_name, item_info, documento_info, stage_key)
+            payload = build_job_payload(request, file_name, mime_type, item_info, documento_info, stage_key)
             payload["service_endpoint"] = service_endpoint
 
             if request.queue.enabled:
@@ -2134,7 +2318,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             update_job_progress(db, job_id, recorder, "RUNNING", "QUEUE_ADMISSION", {"job_id": job_id})
 
             try:
-                pdf_bytes = db.read_large_object(int(request.oid))
+                document_bytes = db.read_large_object(int(request.oid))
             except Exception as exc:
                 raise PipelineError(
                     "LOAD_BINARY",
@@ -2142,34 +2326,88 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     "No fue posible leer el binary del OID solicitado.",
                     {"oid": int(request.oid), "error": f"{type(exc).__name__}: {str(exc)}"},
                 ) from exc
-            if not pdf_bytes:
+            if not document_bytes:
                 raise PipelineError("LOAD_BINARY", "EMPTY_BINARY", "Large object vacio.")
-            binary_sha256 = hashlib.sha256(pdf_bytes).hexdigest()
+            binary_sha256 = hashlib.sha256(document_bytes).hexdigest()
+
+            # Control de hash duplicado en documentos PROCESADOS.
+            if not request.overwrite.allow_duplicate_hash:
+                hash_guard = db.count_processed_documents_by_hash(
+                    contenido_hash=binary_sha256,
+                    exclude_documento_id=documento_id,
+                )
+                if safe_int(hash_guard.get("total"), 0) and int(hash_guard.get("total")) > 0:
+                    raise PipelineError(
+                        "DOCUMENT_HASH_GUARD",
+                        "DUPLICATE_DOCUMENT_HASH",
+                        "Ya existe un documento PROCESADO con el mismo hash y allow_duplicate_hash=false.",
+                        {
+                            "documento_id": documento_id,
+                            "binary_sha256": binary_sha256,
+                            "duplicados_total": safe_int(hash_guard.get("total"), 0),
+                            "duplicados_ids": to_json_safe(hash_guard.get("documento_ids") or []),
+                            "allow_duplicate_hash": bool(request.overwrite.allow_duplicate_hash),
+                        },
+                    )
+
             recorder.push(
                 "LOAD_BINARY",
                 "OK",
-                "PDF cargado desde large object.",
-                {"oid": int(request.oid), "bytes": len(pdf_bytes), "sha256": binary_sha256},
+                "Binary cargado desde large object.",
+                {
+                    "oid": int(request.oid),
+                    "bytes": len(document_bytes),
+                    "sha256": binary_sha256,
+                    "mime_type": mime_type,
+                },
             )
             update_job_progress(db, job_id, recorder, "RUNNING", "LOAD_BINARY")
+            is_pdf_document = mime_type == "application/pdf"
+            selected_binary = document_bytes
+            if is_pdf_document:
+                selected_binary, page_info = apply_page_selection(
+                    pdf_bytes=document_bytes,
+                    page_mode=request.extraction.page_mode,
+                    head_pages=request.extraction.head_pages,
+                    tail_pages=request.extraction.tail_pages,
+                )
+                recorder.push("PAGE_SELECTION", "OK", "Seleccion de paginas aplicada.", page_info)
+                update_job_progress(db, job_id, recorder, "RUNNING", "PAGE_SELECTION")
 
-            selected_pdf, page_info = apply_page_selection(
-                pdf_bytes=pdf_bytes,
-                page_mode=request.extraction.page_mode,
-                head_pages=request.extraction.head_pages,
-                tail_pages=request.extraction.tail_pages,
-            )
-            recorder.push("PAGE_SELECTION", "OK", "Seleccion de paginas aplicada.", page_info)
-            update_job_progress(db, job_id, recorder, "RUNNING", "PAGE_SELECTION")
+                probe = probe_pdf_extractability(selected_binary, request.extraction.probe_max_pages)
+                recorder.push("PROBE", "OK", "Probe de extraibilidad completado.", probe)
+                update_job_progress(db, job_id, recorder, "RUNNING", "PROBE")
 
-            probe = probe_pdf_extractability(selected_pdf, request.extraction.probe_max_pages)
-            recorder.push("PROBE", "OK", "Probe de extraibilidad completado.", probe)
-            update_job_progress(db, job_id, recorder, "RUNNING", "PROBE")
+                engine = resolve_extraction_engine(request.extraction, probe)
+            else:
+                page_info = {
+                    "mode": "full",
+                    "selected_pages": None,
+                    "total_pages": None,
+                    "reason": "non_pdf_docling_mode",
+                }
+                probe = {
+                    "mime_type": mime_type,
+                    "is_pdf": False,
+                    "extractable_confidence": None,
+                    "is_text_extractable": None,
+                }
+                recorder.push("PAGE_SELECTION", "SKIPPED", "Seleccion por paginas aplica solo a PDF.", page_info)
+                recorder.push("PROBE", "SKIPPED", "Probe PyMuPDF aplica solo a PDF.", probe)
+                update_job_progress(db, job_id, recorder, "RUNNING", "PROBE")
+                requested_engine = safe_str(request.extraction.engine, "auto").strip().lower()
+                if requested_engine == "pymupdf":
+                    raise PipelineError(
+                        "MIME_VALIDATION",
+                        "INVALID_ENGINE_FOR_MIME",
+                        "extraction.engine=pymupdf solo aplica para application/pdf.",
+                        {"mime_type": mime_type, "engine": requested_engine},
+                    )
+                engine = "docling"
 
-            engine = resolve_extraction_engine(request.extraction, probe)
-            extraction_meta: Dict[str, Any] = {"engine": engine}
+            extraction_meta: Dict[str, Any] = {"engine": engine, "mime_type": mime_type}
             if engine == "pymupdf":
-                extracted_text, extracted_pages = extract_text_pymupdf(selected_pdf)
+                extracted_text, extracted_pages = extract_text_pymupdf(selected_binary)
                 extraction_meta["ocr_confidence"] = {
                     "source": "pymupdf_probe",
                     "extractable_confidence": safe_float(probe.get("extractable_confidence"), None),
@@ -2179,13 +2417,18 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     "image_ratio": safe_float(probe.get("image_ratio"), None),
                 }
             else:
-                extracted_text, extracted_pages, docling_meta = extract_text_docling(selected_pdf, request.extraction)
+                extracted_text, extracted_pages, docling_meta = extract_text_docling(
+                    selected_binary,
+                    request.extraction,
+                    mime_type=mime_type,
+                    file_name=file_name,
+                )
                 extraction_meta.update(docling_meta)
             if not extracted_text.strip():
                 raise PipelineError(
                     "TEXT_EXTRACTION",
                     "EMPTY_EXTRACTED_TEXT",
-                    "No se pudo extraer texto del PDF.",
+                    "No se pudo extraer texto del archivo.",
                     {"engine": engine},
                 )
             extraction_meta.update(
@@ -2207,7 +2450,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
             # Persistencia temprana del OCR (texto extraido) en GestorDocumental.Documentos.
             ocr_words = count_words(text_for_chunking)
-            ocr_hash = hashlib.sha256(text_for_chunking.encode("utf-8", errors="replace")).hexdigest()
+            ocr_text_hash = hashlib.sha256(text_for_chunking.encode("utf-8", errors="replace")).hexdigest()
             ocr_quality = safe_float(
                 extraction_meta.get("ocr_quality"),
                 safe_float(probe.get("extractable_confidence"), None),
@@ -2224,7 +2467,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 ocr_update_info = db.update_documento_ocr_text(
                     documento_id=documento_id,
                     contenido_texto=text_for_chunking,
-                    contenido_hash=ocr_hash,
+                    contenido_hash=binary_sha256,
                     calidad_ocr=ocr_quality,
                     paginas=ocr_pages,
                     palabras=ocr_words,
@@ -2268,6 +2511,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     "documento_id_resuelto": documento_id,
                     "ocr_chars": len(text_for_chunking),
                     "ocr_words": ocr_words,
+                    "binary_sha256": binary_sha256,
+                    "ocr_text_hash": ocr_text_hash,
                 },
             )
 
@@ -2539,6 +2784,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                                 "palabras": ocr_words,
                                 "paginas": ocr_pages,
                                 "calidad_ocr": ocr_quality,
+                                "hash_binario": binary_sha256,
+                                "hash_texto_limpio": ocr_text_hash,
                                 "probe": to_json_safe(probe),
                                 "confianza": to_json_safe(
                                     extraction_meta.get("docling_confidence")
@@ -2613,6 +2860,8 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "usuario_proceso": request.usuario_proceso,
                 "job_proceso": request.job_proceso,
                 "service_endpoint": service_endpoint,
+                "mime_type": mime_type,
+                "mime_validation": to_json_safe(mime_support_info),
                 "queue_name": queue_name if request.queue.enabled else None,
                 "binary_sha256": binary_sha256,
                 "engine_used": engine,
@@ -2814,6 +3063,7 @@ def sample_request() -> Dict[str, Any]:
         oid=2299268,
         nombre_documento="CTO_EyP_LLA_50_2013.pdf",
         file_name=None,
+        mime_type="application/pdf",
         job_filde_id=4567,
         usuario_proceso="analista_anh",
         job_proceso="JOB_OCR_20260309_001",
@@ -2824,7 +3074,7 @@ def sample_request() -> Dict[str, Any]:
             "ruta_pdf": "\\\\servidor\\share\\CTO_EyP_LLA_50_2013.pdf",
         },
         queue=QueueOptions(enabled=True, max_concurrency=2, queue_when_busy=True),
-        overwrite=OverwriteOptions(enabled=False),
+        overwrite=OverwriteOptions(enabled=False, allow_duplicate_hash=False, allow_reprocess_processed=False),
         extraction=ExtractionOptions(
             engine="auto",
             enable_pymupdf_fast_path=True,
@@ -2841,6 +3091,90 @@ def sample_request() -> Dict[str, Any]:
     return pydantic_model_dump(model)
 
 
+class AuthLoginRequest(BaseModel):
+    """Credenciales para solicitar token fijo del servicio."""
+
+    username: str = Field(..., description="Usuario del servicio.")
+    password: str = Field(..., description="Password del servicio.")
+
+
+def _auth_error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Builds standardized auth error payload."""
+    return {
+        "status": "FAILED",
+        "exitoso": False,
+        "message": "Acceso denegado.",
+        "error": {
+            "phase": "AUTH",
+            "code": code,
+            "message": message,
+            "details": details or {},
+        },
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Extracts Bearer token from Authorization header."""
+    value = safe_str(authorization, "").strip()
+    if not value:
+        return None
+    parts = value.split(" ", 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        token = parts[1].strip()
+        return token or None
+    return None
+
+
+def require_service_auth(
+    authorization: Optional[str] = Header(default=None),
+    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
+) -> bool:
+    """Mandatory API auth via fixed token (Bearer o X-API-Token)."""
+    settings = AuthSettings.from_env()
+    if not settings.enabled:
+        return True
+
+    expected_token = safe_str(settings.fixed_token, "").strip()
+    if not expected_token:
+        raise HTTPException(
+            status_code=403,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_CONFIG_ERROR",
+                    message="Token fijo no configurado en OCR_FIXED_TOKEN.",
+                )
+            ),
+        )
+
+    bearer_token = _extract_bearer_token(authorization)
+    header_token = safe_str(x_api_token, "").strip() or None
+    provided_token = bearer_token or header_token
+
+    if not provided_token:
+        raise HTTPException(
+            status_code=403,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_REQUIRED",
+                    message="Debe enviar Authorization: Bearer <token> o X-API-Token.",
+                )
+            ),
+        )
+
+    if provided_token != expected_token:
+        raise HTTPException(
+            status_code=403,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_INVALID_TOKEN",
+                    message="Token invalido.",
+                )
+            ),
+        )
+    return True
+
+
 app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
@@ -2848,13 +3182,66 @@ app = FastAPI(
     description=(
         "Servicio OpenAPI para OCR, chunking y embeddings.\n"
         "Rutas funcionales: /ocr-docling, /chunking-docling, /embedding-generation, /PipelineOCR.\n"
-        "Entrada obligatoria: oid."
+        "Entrada obligatoria: oid.\n"
+        "Acceso protegido por token fijo (Authorization Bearer o X-API-Token)."
     ),
 )
 
 
+@app.post("/auth/login", tags=[TAG_HELPERS])
+def auth_login(payload: AuthLoginRequest) -> Dict[str, Any]:
+    """
+    Valida credenciales y retorna token fijo del servicio.
+    Usa variables de entorno OCR_AUTH_USER / OCR_AUTH_PASSWORD / OCR_FIXED_TOKEN.
+    """
+    settings = AuthSettings.from_env()
+    if not settings.enabled:
+        return {
+            "status": "ok",
+            "message": "Autenticacion deshabilitada por OCR_AUTH_ENABLED=false.",
+            "auth_enabled": False,
+            "timestamp_utc": utc_now_iso(),
+        }
+
+    if payload.username != settings.username or payload.password != settings.password:
+        raise HTTPException(
+            status_code=403,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_INVALID_CREDENTIALS",
+                    message="Usuario o password invalidos.",
+                )
+            ),
+        )
+
+    token = safe_str(settings.fixed_token, "").strip()
+    if not token:
+        raise HTTPException(
+            status_code=403,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_CONFIG_ERROR",
+                    message="Token fijo no configurado en OCR_FIXED_TOKEN.",
+                )
+            ),
+        )
+
+    return {
+        "status": "ok",
+        "message": "Login exitoso.",
+        "token_type": "Bearer",
+        "access_token": token,
+        "expires_in": None,
+        "header_examples": {
+            "Authorization": f"Bearer {token}",
+            "X-API-Token": token,
+        },
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
 @app.get("/health", tags=[TAG_HELPERS])
-def health() -> Dict[str, Any]:
+def health(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
     """Health endpoint."""
     return {
         "status": "ok",
@@ -2866,13 +3253,13 @@ def health() -> Dict[str, Any]:
 
 
 @app.get("/example-request", tags=[TAG_HELPERS])
-def example_request() -> Dict[str, Any]:
+def example_request(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
     """Returns request payload example."""
     return {"input": sample_request()}
 
 
 @app.get("/validate-db", tags=[TAG_HELPERS])
-def validate_db() -> Dict[str, Any]:
+def validate_db(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
     """
     Valida conexión a Postgres a nivel API.
     Retorna versión, metadatos y una consulta de prueba.
@@ -2968,49 +3355,73 @@ def _run_batch_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingB
 
 
 @app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=[TAG_OCR])
-def ocr_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+def ocr_docling_process(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingResponse:
     """Ejecuta solo OCR + limpieza de texto."""
     return _run_single_stage_or_403(payload, stage="ocr")
 
 
 @app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_OCR])
-def ocr_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+def ocr_docling_batch(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="ocr")
 
 
 @app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=[TAG_CHUNKING])
-def chunking_docling_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+def chunking_docling_process(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking."""
     return _run_single_stage_or_403(payload, stage="chunking")
 
 
 @app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_CHUNKING])
-def chunking_docling_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+def chunking_docling_batch(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza + chunking para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="chunking")
 
 
 @app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=[TAG_EMBEDDING])
-def embedding_generation_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+def embedding_generation_process(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
     return _run_single_stage_or_403(payload, stage="embedding")
 
 
 @app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_EMBEDDING])
-def embedding_generation_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+def embedding_generation_batch(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingBatchResponse:
     """Ejecuta generacion de embeddings para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="embedding")
 
 
 @app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=[TAG_PIPELINE])
-def pipeline_ocr_process(payload: Dict[str, Any]) -> OCRChunkingResponse:
+def pipeline_ocr_process(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingResponse:
     """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
     return _run_single_stage_or_403(payload, stage="pipeline")
 
 
 @app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_PIPELINE])
-def pipeline_ocr_batch(payload: Dict[str, Any]) -> OCRChunkingBatchResponse:
+def pipeline_ocr_batch(
+    payload: Dict[str, Any],
+    _: bool = Depends(require_service_auth),
+) -> OCRChunkingBatchResponse:
     """Orquesta flujo completo para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="pipeline")
 
