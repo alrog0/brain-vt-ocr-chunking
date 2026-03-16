@@ -26,6 +26,22 @@ MIME soportados: PDF, DOCX/XLSX/PPTX, Markdown, AsciiDoc, LaTeX, HTML/XHTML, CSV
 - `GET /health`
 - `GET /example-request`
 
+## Autenticacion obligatoria
+
+El servicio ahora exige token para acceder a los endpoints (excepto login):
+
+- `POST /auth/login` (recibe `username` y `password`).
+- Header requerido en las demas rutas:
+  - `Authorization: Bearer <token>` **o**
+  - `X-API-Token: <token>`
+
+Variables de entorno:
+
+- `OCR_AUTH_ENABLED` (default `true`)
+- `OCR_AUTH_USER` (default `admin`)
+- `OCR_AUTH_PASSWORD` (default `admin`)
+- `OCR_FIXED_TOKEN` (default `CAMBIAR_TOKEN_OBLIGATORIO`)
+
 ## Flujo interno
 
 ```mermaid

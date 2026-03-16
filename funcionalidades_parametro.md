@@ -2,6 +2,18 @@
 
 Descripcion de que hace cada parametro en el payload `input`.
 
+## Autenticacion de API (obligatoria)
+
+No va dentro del payload `input`; se envia por headers.
+
+- `Authorization: Bearer <token>` o `X-API-Token: <token>`.
+- Token obtenido por `POST /auth/login` con `username` y `password`.
+- Variables de entorno:
+  - `OCR_AUTH_ENABLED` (default `true`)
+  - `OCR_AUTH_USER` (default `admin`)
+  - `OCR_AUTH_PASSWORD` (default `admin`)
+  - `OCR_FIXED_TOKEN` (default `CAMBIAR_TOKEN_OBLIGATORIO`)
+
 ## Parametros principales
 
 ## `oid` (obligatorio)
