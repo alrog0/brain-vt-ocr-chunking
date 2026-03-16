@@ -1,14 +1,17 @@
 ﻿# OCR Chunking Embedding - Guia rapida
 
-Servicio OpenAPI para procesar documentos PDF (OCR, chunking y embeddings) desde un `oid`.
+Servicio OpenAPI para procesar documentos (OCR, chunking y embeddings) desde un `oid`.
 
 ## Idea clave
 
-- `oid` es el identificador principal del proceso (LOID del PDF).
+- `oid` es el identificador principal del proceso (LOID del archivo).
 - El `documento_id` real se resuelve internamente en `GestorDocumental.Documentos` por `metadatosExtra.ocr.metadata.oid` y fallback por `archivoNombre`.
 - Si se envia `nombre_documento`, no se consulta el nombre en `ItemsIngestaSmb` por OID.
 - Al terminar OCR+limpieza, el servicio actualiza `GestorDocumental.Documentos.contenidoTexto`.
-- El response incluye `ocr_quality` y `ocr_confidence` (detalle de confianza OCR).
+- Se valida `mime_type` (ejemplo: `application/pdf`) contra formatos soportados por Docling (sin audio/video).
+- El response incluye `ocr_quality` y `ocr_confidence` (sin detalle pagina a pagina).
+
+MIME soportados: PDF, DOCX/XLSX/PPTX, Markdown, AsciiDoc, LaTeX, HTML/XHTML, CSV e imagenes PNG/JPEG/TIFF/BMP/WEBP.
 
 ## Endpoints por proceso
 
@@ -23,16 +26,33 @@ Servicio OpenAPI para procesar documentos PDF (OCR, chunking y embeddings) desde
 - `GET /health`
 - `GET /example-request`
 
+## Autenticacion obligatoria
+
+El servicio ahora exige token para acceder a los endpoints (excepto login):
+
+- `POST /auth/login` (recibe `username` y `password`).
+- Header requerido en las demas rutas:
+  - `Authorization: Bearer <token>` **o**
+  - `X-API-Token: <token>`
+
+Variables de entorno:
+
+- `OCR_AUTH_ENABLED` (default `true`)
+- `OCR_AUTH_USER` (default `admin`)
+- `OCR_AUTH_PASSWORD` (default `admin`)
+- `OCR_FIXED_TOKEN` (default `CAMBIAR_TOKEN_OBLIGATORIO`)
+
 ## Flujo interno
 
 ```mermaid
 flowchart TD
     A[Request] --> B[Validacion]
     B --> C[Queue control]
-    C --> D[Leer PDF por oid]
-    D --> E[Seleccion de paginas]
-    E --> F[Probe PyMuPDF]
-    F --> G[Extraccion OCR/texto]
+    C --> D[Leer archivo por oid]
+    D --> E{mime_type=application/pdf?}
+    E -- si --> F[Seleccion de paginas + Probe PyMuPDF]
+    E -- no --> G[Extraccion Docling directa]
+    F --> G
     G --> H[Limpieza]
     H --> I{Proceso requiere chunking?}
     I -- no --> Z1[Respuesta OCR]
@@ -63,6 +83,7 @@ flowchart TD
   "input": {
     "oid": 2299268,
     "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
+    "mime_type": "application/pdf",
     "job_filde_id": 4567,
     "usuario_proceso": "analista_anh",
     "job_proceso": "JOB_OCR_20260309_001",
@@ -71,6 +92,11 @@ flowchart TD
       "nombre_documento": "CTO_EyP_LLA_50_2013.pdf",
       "metadata_documento": {"paginas": 133, "idioma": "es"},
       "ruta_pdf": "\\\\servidor\\share\\CTO_EyP_LLA_50_2013.pdf"
+    },
+    "overwrite": {
+      "enabled": false,
+      "allow_duplicate_hash": false,
+      "allow_reprocess_processed": false
     }
   }
 }
