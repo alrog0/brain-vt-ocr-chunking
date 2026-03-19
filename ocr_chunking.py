@@ -35,6 +35,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional, Tuple
 
 import fitz
+import jwt
 import psycopg2
 import torch
 import torch.nn.functional as torch_functional
@@ -44,7 +45,10 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.types.doc import DocItemLabel, DoclingDocument
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jwt import PyJWKClient
+from jwt.exceptions import ExpiredSignatureError, InvalidIssuerError, InvalidTokenError
 from pydantic import BaseModel, Field
 from psycopg2.extras import RealDictCursor, execute_batch
 from transformers import AutoModel, AutoTokenizer
@@ -72,9 +76,11 @@ DEFAULT_CREATED_BY = 1101
 DEFAULT_TIMEOUT_SECONDS = 1800
 DEFAULT_PROBE_MAX_PAGES = 60
 DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
-DEFAULT_AUTH_USERNAME = "ANHAuthUser2026"
-DEFAULT_AUTH_PASSWORD = "%4;=q[{/,{vj%8V65SyLoj]>wn"
-DEFAULT_AUTH_FIXED_TOKEN = "6d87ccd5-473f-4464-81ec-e7aaaea99c93"
+DEFAULT_AUTH_ENABLED = True
+DEFAULT_JWT_ISSUER = "https://anh-pro.flows.ninja/auth/realms/airflows"
+DEFAULT_JWKS_URL = f"{DEFAULT_JWT_ISSUER}/protocol/openid-connect/certs"
+DEFAULT_JWT_AZP = "ocr-chunking-embeddings"
+DEFAULT_JWT_CLIENT_ID = "ocr-chunking-embeddings"
 SERVICE_STAGE_ENDPOINTS = {
     "ocr": "/ocr-docling/process",
     "chunking": "/chunking-docling/process",
@@ -165,7 +171,43 @@ _DOCLING_CONVERTER_CACHE: Dict[str, Any] = {}
 _MODEL_LOCK = Lock()
 _TOKENIZER_LOCK = Lock()
 _DOCLING_LOCK = Lock()
+_JWK_CLIENT: Optional[PyJWKClient] = None
+_BEARER_SCHEME = HTTPBearer(
+    auto_error=False,
+    description="JWT Bearer emitido por Keycloak para acceder al servicio.",
+)
 
+
+@dataclass
+class AuthSettings:
+    """JWT auth settings for API access control."""
+
+    enabled: bool
+    issuer: str
+    jwks_url: str
+    audience: Optional[str]
+    expected_azp: Optional[str]
+    expected_client_id: Optional[str]
+    algorithms: List[str]
+
+    @staticmethod
+    def from_env() -> "AuthSettings":
+        """Loads JWT auth settings from environment."""
+        algorithms_raw = safe_str(os.getenv("OCR_JWT_ALGORITHMS", "RS256"), "RS256")
+        algorithms = [item.strip() for item in algorithms_raw.split(",") if item.strip()]
+        return AuthSettings(
+            enabled=safe_bool(os.getenv("OCR_AUTH_ENABLED", str(DEFAULT_AUTH_ENABLED).lower()), DEFAULT_AUTH_ENABLED),
+            issuer=safe_str(os.getenv("OCR_JWT_ISSUER", DEFAULT_JWT_ISSUER), DEFAULT_JWT_ISSUER).strip(),
+            jwks_url=safe_str(os.getenv("OCR_JWKS_URL", DEFAULT_JWKS_URL), DEFAULT_JWKS_URL).strip(),
+            audience=safe_str(os.getenv("OCR_JWT_AUDIENCE", ""), "").strip() or None,
+            expected_azp=safe_str(os.getenv("OCR_JWT_EXPECTED_AZP", DEFAULT_JWT_AZP), DEFAULT_JWT_AZP).strip() or None,
+            expected_client_id=safe_str(
+                os.getenv("OCR_JWT_EXPECTED_CLIENT_ID", DEFAULT_JWT_CLIENT_ID),
+                DEFAULT_JWT_CLIENT_ID,
+            ).strip()
+            or None,
+            algorithms=algorithms or ["RS256"],
+        )
 
 def utc_now_iso() -> str:
     """Returns UTC timestamp as ISO string."""
@@ -330,6 +372,174 @@ def pydantic_model_dump_json(model: BaseModel, *, indent: int = 2) -> str:
         return model.model_dump_json(indent=indent)
     return model.json(indent=indent, ensure_ascii=False)
 
+def _auth_error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Builds standardized auth error payload."""
+    return {
+        "status": "FAILED",
+        "exitoso": False,
+        "message": "Acceso denegado.",
+        "error": {
+            "phase": "AUTH",
+            "code": code,
+            "message": message,
+            "details": details or {},
+        },
+        "timestamp_utc": utc_now_iso(),
+    }
+
+
+def _get_jwk_client(settings: AuthSettings) -> PyJWKClient:
+    """Returns a cached JWKS client for the configured issuer."""
+    global _JWK_CLIENT
+    if _JWK_CLIENT is None:
+        _JWK_CLIENT = PyJWKClient(settings.jwks_url)
+    return _JWK_CLIENT
+
+
+def _extract_bearer_token(credentials: Optional[HTTPAuthorizationCredentials]) -> str:
+    """Extracts Bearer token from FastAPI security credentials."""
+    if credentials is None:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_REQUIRED",
+                    message="Debe enviar Authorization: Bearer <token>.",
+                )
+            ),
+        )
+
+    scheme = safe_str(getattr(credentials, "scheme", ""), "").strip().lower()
+    token = safe_str(getattr(credentials, "credentials", ""), "").strip()
+    if scheme != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_INVALID_HEADER",
+                    message="El header Authorization debe ser Bearer <token>.",
+                )
+            ),
+        )
+
+    if not token:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_EMPTY_TOKEN",
+                    message="Token Bearer vacio.",
+                )
+            ),
+        )
+    return token
+
+
+def validate_keycloak_token(token: str, settings: AuthSettings) -> Dict[str, Any]:
+    """Validates JWT signature and required claims against Keycloak JWKS."""
+    try:
+        signing_key = _get_jwk_client(settings).get_signing_key_from_jwt(token)
+        decode_kwargs: Dict[str, Any] = {
+            "jwt": token,
+            "key": signing_key.key,
+            "algorithms": settings.algorithms,
+            "issuer": settings.issuer,
+            "options": {
+                "require": ["exp", "iat", "iss"],
+                "verify_aud": settings.audience is not None,
+            },
+        }
+        if settings.audience is not None:
+            decode_kwargs["audience"] = settings.audience
+
+        payload = jwt.decode(**decode_kwargs)
+
+        if settings.expected_azp and safe_str(payload.get("azp"), "").strip() != settings.expected_azp:
+            raise HTTPException(
+                status_code=403,
+                detail=to_json_safe(
+                    _auth_error_detail(
+                        code="AUTH_INVALID_AZP",
+                        message="Claim azp no autorizado.",
+                        details={"expected": settings.expected_azp, "received": payload.get("azp")},
+                    )
+                ),
+            )
+
+        if (
+            settings.expected_client_id
+            and safe_str(payload.get("clientId"), "").strip() != settings.expected_client_id
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail=to_json_safe(
+                    _auth_error_detail(
+                        code="AUTH_INVALID_CLIENT_ID",
+                        message="Claim clientId no autorizado.",
+                        details={
+                            "expected": settings.expected_client_id,
+                            "received": payload.get("clientId"),
+                        },
+                    )
+                ),
+            )
+        return payload
+    except HTTPException:
+        raise
+    except ExpiredSignatureError:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_TOKEN_EXPIRED",
+                    message="Token expirado.",
+                )
+            ),
+        )
+    except InvalidIssuerError:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_INVALID_ISSUER",
+                    message="Issuer invalido.",
+                )
+            ),
+        )
+    except InvalidTokenError as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_INVALID_TOKEN",
+                    message="Token invalido.",
+                    details={"reason": safe_str(exc)},
+                )
+            ),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=401,
+            detail=to_json_safe(
+                _auth_error_detail(
+                    code="AUTH_VALIDATION_ERROR",
+                    message="No fue posible validar el token.",
+                    details={"reason": safe_str(exc)},
+                )
+            ),
+        )
+
+
+def require_service_auth(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_BEARER_SCHEME),
+) -> Dict[str, Any]:
+    """Mandatory API auth via JWT Bearer token validated against Keycloak JWKS."""
+    settings = AuthSettings.from_env()
+    if not settings.enabled:
+        return {}
+    token = _extract_bearer_token(credentials)
+    return validate_keycloak_token(token, settings)
+
 
 def vector_to_pg_literal(vector: List[float]) -> str:
     """Converts vector to pgvector literal."""
@@ -408,26 +618,6 @@ class PostgresSettings:
             dbname=os.getenv("OCR_DB_NAME", "niledb"),
             user=os.getenv("OCR_DB_USER", "postgres"),
             password=os.getenv("OCR_DB_PASSWORD", "plexia"),
-        )
-
-
-@dataclass
-class AuthSettings:
-    """Auth settings for API access control."""
-
-    enabled: bool
-    username: str
-    password: str
-    fixed_token: str
-
-    @staticmethod
-    def from_env() -> "AuthSettings":
-        """Loads auth settings from environment."""
-        return AuthSettings(
-            enabled=safe_bool(os.getenv("OCR_AUTH_ENABLED", "true"), True),
-            username=safe_str(os.getenv("OCR_AUTH_USER", DEFAULT_AUTH_USERNAME), DEFAULT_AUTH_USERNAME),
-            password=safe_str(os.getenv("OCR_AUTH_PASSWORD", DEFAULT_AUTH_PASSWORD), DEFAULT_AUTH_PASSWORD),
-            fixed_token=safe_str(os.getenv("OCR_FIXED_TOKEN", DEFAULT_AUTH_FIXED_TOKEN), DEFAULT_AUTH_FIXED_TOKEN),
         )
 
 
@@ -3091,90 +3281,6 @@ def sample_request() -> Dict[str, Any]:
     return pydantic_model_dump(model)
 
 
-class AuthLoginRequest(BaseModel):
-    """Credenciales para solicitar token fijo del servicio."""
-
-    username: str = Field(..., description="Usuario del servicio.")
-    password: str = Field(..., description="Password del servicio.")
-
-
-def _auth_error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Builds standardized auth error payload."""
-    return {
-        "status": "FAILED",
-        "exitoso": False,
-        "message": "Acceso denegado.",
-        "error": {
-            "phase": "AUTH",
-            "code": code,
-            "message": message,
-            "details": details or {},
-        },
-        "timestamp_utc": utc_now_iso(),
-    }
-
-
-def _extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
-    """Extracts Bearer token from Authorization header."""
-    value = safe_str(authorization, "").strip()
-    if not value:
-        return None
-    parts = value.split(" ", 1)
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        token = parts[1].strip()
-        return token or None
-    return None
-
-
-def require_service_auth(
-    authorization: Optional[str] = Header(default=None),
-    x_api_token: Optional[str] = Header(default=None, alias="X-API-Token"),
-) -> bool:
-    """Mandatory API auth via fixed token (Bearer o X-API-Token)."""
-    settings = AuthSettings.from_env()
-    if not settings.enabled:
-        return True
-
-    expected_token = safe_str(settings.fixed_token, "").strip()
-    if not expected_token:
-        raise HTTPException(
-            status_code=403,
-            detail=to_json_safe(
-                _auth_error_detail(
-                    code="AUTH_CONFIG_ERROR",
-                    message="Token fijo no configurado en OCR_FIXED_TOKEN.",
-                )
-            ),
-        )
-
-    bearer_token = _extract_bearer_token(authorization)
-    header_token = safe_str(x_api_token, "").strip() or None
-    provided_token = bearer_token or header_token
-
-    if not provided_token:
-        raise HTTPException(
-            status_code=403,
-            detail=to_json_safe(
-                _auth_error_detail(
-                    code="AUTH_REQUIRED",
-                    message="Debe enviar Authorization: Bearer <token> o X-API-Token.",
-                )
-            ),
-        )
-
-    if provided_token != expected_token:
-        raise HTTPException(
-            status_code=403,
-            detail=to_json_safe(
-                _auth_error_detail(
-                    code="AUTH_INVALID_TOKEN",
-                    message="Token invalido.",
-                )
-            ),
-        )
-    return True
-
-
 app = FastAPI(
     title=SERVICE_NAME,
     version=SERVICE_VERSION,
@@ -3183,65 +3289,13 @@ app = FastAPI(
         "Servicio OpenAPI para OCR, chunking y embeddings.\n"
         "Rutas funcionales: /ocr-docling, /chunking-docling, /embedding-generation, /PipelineOCR.\n"
         "Entrada obligatoria: oid.\n"
-        "Acceso protegido por token fijo (Authorization Bearer o X-API-Token)."
+        "Acceso protegido por JWT Bearer validado contra Keycloak JWKS."
     ),
 )
 
 
-@app.post("/auth/login", tags=[TAG_HELPERS])
-def auth_login(payload: AuthLoginRequest) -> Dict[str, Any]:
-    """
-    Valida credenciales y retorna token fijo del servicio.
-    Usa variables de entorno OCR_AUTH_USER / OCR_AUTH_PASSWORD / OCR_FIXED_TOKEN.
-    """
-    settings = AuthSettings.from_env()
-    if not settings.enabled:
-        return {
-            "status": "ok",
-            "message": "Autenticacion deshabilitada por OCR_AUTH_ENABLED=false.",
-            "auth_enabled": False,
-            "timestamp_utc": utc_now_iso(),
-        }
-
-    if payload.username != settings.username or payload.password != settings.password:
-        raise HTTPException(
-            status_code=403,
-            detail=to_json_safe(
-                _auth_error_detail(
-                    code="AUTH_INVALID_CREDENTIALS",
-                    message="Usuario o password invalidos.",
-                )
-            ),
-        )
-
-    token = safe_str(settings.fixed_token, "").strip()
-    if not token:
-        raise HTTPException(
-            status_code=403,
-            detail=to_json_safe(
-                _auth_error_detail(
-                    code="AUTH_CONFIG_ERROR",
-                    message="Token fijo no configurado en OCR_FIXED_TOKEN.",
-                )
-            ),
-        )
-
-    return {
-        "status": "ok",
-        "message": "Login exitoso.",
-        "token_type": "Bearer",
-        "access_token": token,
-        "expires_in": None,
-        "header_examples": {
-            "Authorization": f"Bearer {token}",
-            "X-API-Token": token,
-        },
-        "timestamp_utc": utc_now_iso(),
-    }
-
-
 @app.get("/health", tags=[TAG_HELPERS])
-def health(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
+def health(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
     """Health endpoint."""
     return {
         "status": "ok",
@@ -3253,13 +3307,13 @@ def health(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
 
 
 @app.get("/example-request", tags=[TAG_HELPERS])
-def example_request(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
+def example_request(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:    
     """Returns request payload example."""
     return {"input": sample_request()}
 
 
 @app.get("/validate-db", tags=[TAG_HELPERS])
-def validate_db(_: bool = Depends(require_service_auth)) -> Dict[str, Any]:
+def validate_db(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
     """
     Valida conexión a Postgres a nivel API.
     Retorna versión, metadatos y una consulta de prueba.
@@ -3357,7 +3411,7 @@ def _run_batch_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingB
 @app.post("/ocr-docling/process", response_model=OCRChunkingResponse, tags=[TAG_OCR])
 def ocr_docling_process(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingResponse:
     """Ejecuta solo OCR + limpieza de texto."""
     return _run_single_stage_or_403(payload, stage="ocr")
@@ -3366,7 +3420,7 @@ def ocr_docling_process(
 @app.post("/ocr-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_OCR])
 def ocr_docling_batch(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="ocr")
@@ -3375,7 +3429,7 @@ def ocr_docling_batch(
 @app.post("/chunking-docling/process", response_model=OCRChunkingResponse, tags=[TAG_CHUNKING])
 def chunking_docling_process(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking."""
     return _run_single_stage_or_403(payload, stage="chunking")
@@ -3384,7 +3438,7 @@ def chunking_docling_process(
 @app.post("/chunking-docling/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_CHUNKING])
 def chunking_docling_batch(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingBatchResponse:
     """Ejecuta OCR + limpieza + chunking para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="chunking")
@@ -3393,7 +3447,7 @@ def chunking_docling_batch(
 @app.post("/embedding-generation/process", response_model=OCRChunkingResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_process(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingResponse:
     """Ejecuta OCR + limpieza + chunking + generacion de embeddings."""
     return _run_single_stage_or_403(payload, stage="embedding")
@@ -3402,7 +3456,7 @@ def embedding_generation_process(
 @app.post("/embedding-generation/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_EMBEDDING])
 def embedding_generation_batch(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingBatchResponse:
     """Ejecuta generacion de embeddings para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="embedding")
@@ -3411,7 +3465,7 @@ def embedding_generation_batch(
 @app.post("/PipelineOCR/process", response_model=OCRChunkingResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_process(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingResponse:
     """Orquesta todo el flujo: OCR, limpieza, chunking, embeddings e insercion."""
     return _run_single_stage_or_403(payload, stage="pipeline")
@@ -3420,7 +3474,7 @@ def pipeline_ocr_process(
 @app.post("/PipelineOCR/process-batch", response_model=OCRChunkingBatchResponse, tags=[TAG_PIPELINE])
 def pipeline_ocr_batch(
     payload: Dict[str, Any],
-    _: bool = Depends(require_service_auth),
+    _: Dict[str, Any] = Depends(require_service_auth),
 ) -> OCRChunkingBatchResponse:
     """Orquesta flujo completo para varios documentos."""
     return _run_batch_stage_or_403(payload, stage="pipeline")

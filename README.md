@@ -28,19 +28,44 @@ MIME soportados: PDF, DOCX/XLSX/PPTX, Markdown, AsciiDoc, LaTeX, HTML/XHTML, CSV
 
 ## Autenticacion obligatoria
 
-El servicio ahora exige token para acceder a los endpoints (excepto login):
+El servicio protege los endpoints con JWT Bearer validado contra Keycloak mediante JWKS.
 
-- `POST /auth/login` (recibe `username` y `password`).
-- Header requerido en las demas rutas:
-  - `Authorization: Bearer <token>` **o**
-  - `X-API-Token: <token>`
+- Header requerido:
+  - `Authorization: Bearer <token>`
+- Si `OCR_AUTH_ENABLED=false`, la validacion se desactiva.
+- El token debe ser valido en firma y cumplir los claims/configuracion esperados.
+
+Validaciones aplicadas al token:
+
+- Firma JWT contra `JWKS`.
+- `iss` obligatorio.
+- `exp` obligatorio.
+- `iat` obligatorio.
+- `aud` solo si se configura `OCR_JWT_AUDIENCE`.
+- `azp` si se configura `OCR_JWT_EXPECTED_AZP`.
+- `clientId` si se configura `OCR_JWT_EXPECTED_CLIENT_ID`.
 
 Variables de entorno:
 
 - `OCR_AUTH_ENABLED` (default `true`)
-- `OCR_AUTH_USER` (default `admin`)
-- `OCR_AUTH_PASSWORD` (default `admin`)
-- `OCR_FIXED_TOKEN` (default `CAMBIAR_TOKEN_OBLIGATORIO`)
+- `OCR_JWT_ISSUER` (default `https://anh-pro.flows.ninja/auth/realms/airflows`)
+- `OCR_JWKS_URL` (default `https://anh-pro.flows.ninja/auth/realms/airflows/protocol/openid-connect/certs`)
+- `OCR_JWT_AUDIENCE` (default vacio, no valida `aud` si no se define)
+- `OCR_JWT_EXPECTED_AZP` (default `ocr-chunking-embeddings`)
+- `OCR_JWT_EXPECTED_CLIENT_ID` (default `ocr-chunking-embeddings`)
+- `OCR_JWT_ALGORITHMS` (default `RS256`, admite lista separada por comas)
+
+Errores de autenticacion comunes:
+
+- `AUTH_REQUIRED`
+- `AUTH_INVALID_HEADER`
+- `AUTH_EMPTY_TOKEN`
+- `AUTH_TOKEN_EXPIRED`
+- `AUTH_INVALID_ISSUER`
+- `AUTH_INVALID_TOKEN`
+- `AUTH_INVALID_AZP`
+- `AUTH_INVALID_CLIENT_ID`
+- `AUTH_VALIDATION_ERROR`
 
 ## Flujo interno
 
