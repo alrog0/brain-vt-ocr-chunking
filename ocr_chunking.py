@@ -1410,6 +1410,17 @@ class OCRChunkingRequest(BaseModel):
         default=None,
         description="Id de archivo/job para trazabilidad (compatibilidad con nombre solicitado).",
     )
+    job_field_id: Optional[int] = Field(
+        default=None,
+        description="Alias corregido de job_filde_id para compatibilidad con versiones recientes.",
+    )
+    documento_id: Optional[int] = Field(
+        default=None,
+        description=(
+            "documentoId de GestorDocumental.Documentos ya resuelto por el caller. "
+            "Si se provee, omite la resolución por metadatosExtra/archivoNombre y lo usa directamente."
+        ),
+    )
     usuario_proceso: Optional[str] = Field(
         default=None,
         description="Usuario funcional que ejecuta la solicitud.",
@@ -2346,46 +2357,75 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         {"file_name": file_name},
                     )
 
-            # Resuelve documentoId real (FK) por OID dentro de metadatosExtra y fallback por nombre de archivo.
-            documento_info = db.fetch_documento_by_metadata_oid(int(request.oid))
-            if documento_info is not None:
-                documento_id = safe_int(documento_info.get("documento_id"), None)
+            # Resuelve documentoId real (FK).
+            # Si el caller ya resolvió documento_id (path rápido), se usa directamente.
+            # Si no, se resuelve por metadatosExtra.ocr.metadata.oid y fallback por archivoNombre.
+            documento_info = None
+            caller_documento_id = safe_int(request.documento_id, None)
+            if caller_documento_id is not None:
+                documento_id = caller_documento_id
                 recorder.push(
                     "LOAD_DOCUMENT",
                     "OK",
-                    "Documento resuelto por metadatosExtra.ocr.metadata.oid.",
-                    {
-                        "documento_id": documento_id,
-                        "archivo_nombre": safe_str(documento_info.get("archivo_nombre"), ""),
-                    },
+                    "documentoId recibido directamente del caller; omitiendo resolución por metadatosExtra/archivoNombre.",
+                    {"documento_id": documento_id, "oid": int(request.oid)},
                 )
-            elif file_name:
-                documento_info = db.fetch_documento_by_file_name(file_name)
+            else:
+                documento_info = db.fetch_documento_by_metadata_oid(int(request.oid))
                 if documento_info is not None:
                     documento_id = safe_int(documento_info.get("documento_id"), None)
                     recorder.push(
                         "LOAD_DOCUMENT",
                         "OK",
-                        "Documento resuelto por archivoNombre (fallback).",
+                        "Documento resuelto por metadatosExtra.ocr.metadata.oid.",
                         {
                             "documento_id": documento_id,
                             "archivo_nombre": safe_str(documento_info.get("archivo_nombre"), ""),
-                            "file_name_input": file_name,
                         },
                     )
+                elif file_name:
+                    documento_info = db.fetch_documento_by_file_name(file_name)
+                    if documento_info is not None:
+                        documento_id = safe_int(documento_info.get("documento_id"), None)
+                        recorder.push(
+                            "LOAD_DOCUMENT",
+                            "OK",
+                            "Documento resuelto por archivoNombre (fallback).",
+                            {
+                                "documento_id": documento_id,
+                                "archivo_nombre": safe_str(documento_info.get("archivo_nombre"), ""),
+                                "file_name_input": file_name,
+                            },
+                        )
+                    else:
+                        recorder.push(
+                            "LOAD_DOCUMENT",
+                            "WARN",
+                            "No se resolvio documentoId en GestorDocumental.Documentos; se usara null en FK.",
+                            {"oid": int(request.oid), "file_name": file_name},
+                        )
                 else:
                     recorder.push(
                         "LOAD_DOCUMENT",
                         "WARN",
                         "No se resolvio documentoId en GestorDocumental.Documentos; se usara null en FK.",
-                        {"oid": int(request.oid), "file_name": file_name},
+                        {"oid": int(request.oid)},
                     )
-            else:
-                recorder.push(
+
+            # Fallo temprano: si save_to_db=true y documentoId no resuelto, no tiene sentido gastar GPU.
+            if documento_id is None and run_persist_stage and request.embedding.save_to_db:
+                raise PipelineError(
                     "LOAD_DOCUMENT",
-                    "WARN",
-                    "No se resolvio documentoId en GestorDocumental.Documentos; se usara null en FK.",
-                    {"oid": int(request.oid)},
+                    "MISSING_REQUIRED_DOCUMENTO_ID",
+                    "documentoId no resuelto y embedding.save_to_db=true; abortando antes del OCR para evitar desperdicio de GPU.",
+                    {
+                        "oid": int(request.oid),
+                        "file_name": file_name,
+                        "hint": (
+                            "Pase documento_id en el request, o asegurese de que GestorDocumental.Documentos "
+                            "tenga el registro antes de llamar al pipeline."
+                        ),
+                    },
                 )
 
             # Reproceso de documento en estado PROCESADO.
