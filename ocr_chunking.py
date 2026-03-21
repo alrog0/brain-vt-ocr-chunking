@@ -3916,6 +3916,23 @@ def _log_base_dir() -> str:
     return _ensure_log_dir()
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_FILENAME_RE = re.compile(r"^[\w\-\.]+$")
+
+
+def _safe_log_path(base: str, *parts: str) -> str:
+    """Joins path parts and ensures the result stays within `base`.
+
+    Raises HTTPException(400) if traversal is detected (e.g. '../../etc').
+    """
+    joined = os.path.normpath(os.path.join(base, *parts))
+    real_base = os.path.realpath(base)
+    real_joined = os.path.realpath(joined)
+    if not real_joined.startswith(real_base + os.sep) and real_joined != real_base:
+        raise HTTPException(status_code=400, detail="Ruta de log invalida.")
+    return joined
+
+
 def _today_log_dir() -> str:
     """Returns today's date subdirectory."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -4075,11 +4092,14 @@ def logs_list(
     target_dates: List[str] = []
 
     if date_filter:
-        target_dates = [date_filter.strip()]
+        clean_date = date_filter.strip()
+        if not _DATE_RE.match(clean_date):
+            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Use YYYY-MM-DD.")
+        target_dates = [clean_date]
     else:
         try:
             target_dates = sorted(
-                [e for e in os.listdir(base) if os.path.isdir(os.path.join(base, e))],
+                [e for e in os.listdir(base) if _DATE_RE.match(e) and os.path.isdir(_safe_log_path(base, e))],
                 reverse=True,
             )[:30]
         except FileNotFoundError:
@@ -4087,11 +4107,11 @@ def logs_list(
 
     results: List[Dict[str, Any]] = []
     for day in target_dates:
-        day_path = os.path.join(base, day)
+        day_path = _safe_log_path(base, day)
         if not os.path.isdir(day_path):
             continue
         for fname in sorted(os.listdir(day_path), reverse=True):
-            if not fname.endswith(".jsonl"):
+            if not fname.endswith(".jsonl") or not _SAFE_FILENAME_RE.match(fname):
                 continue
             if status_filter:
                 sf = status_filter.strip().lower()
@@ -4099,7 +4119,7 @@ def logs_list(
                     continue
                 if sf == "pipeline" and fname.startswith("errors_"):
                     continue
-            fpath = os.path.join(day_path, fname)
+            fpath = _safe_log_path(base, day, fname)
             results.append({
                 "date": day,
                 "filename": fname,
@@ -4131,16 +4151,21 @@ def logs_detail(
     """
     base = _log_base_dir()
     clean_name = os.path.basename(filename)
+    if not clean_name or not _SAFE_FILENAME_RE.match(clean_name) or not clean_name.endswith(".jsonl"):
+        raise HTTPException(status_code=400, detail="Nombre de archivo de log invalido.")
 
     search_dates: List[str] = []
     if date_filter:
-        search_dates = [date_filter.strip()]
+        clean_date = date_filter.strip()
+        if not _DATE_RE.match(clean_date):
+            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Use YYYY-MM-DD.")
+        search_dates = [clean_date]
     else:
         today = datetime.now(timezone.utc)
         search_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
 
     for day in search_dates:
-        fpath = os.path.join(base, day, clean_name)
+        fpath = _safe_log_path(base, day, clean_name)
         if os.path.isfile(fpath):
             entries: List[Dict[str, Any]] = []
             with open(fpath, "r", encoding="utf-8") as f:
@@ -4155,7 +4180,6 @@ def logs_detail(
                 "timestamp_utc": utc_now_iso(),
                 "filename": clean_name,
                 "date": day,
-                "path": os.path.abspath(fpath),
                 "size_bytes": os.path.getsize(fpath),
                 "entries_count": len(entries),
                 "entries": entries,
