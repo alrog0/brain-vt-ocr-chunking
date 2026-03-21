@@ -55,7 +55,7 @@ from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.types.doc import DocItemLabel, DoclingDocument
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Security, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from jwt import PyJWKClient
+from jwt.jwks_client import PyJWKClient
 from jwt.exceptions import ExpiredSignatureError, InvalidIssuerError, InvalidTokenError
 from pydantic import BaseModel, Field
 from psycopg2.extras import RealDictCursor, execute_batch
@@ -2332,7 +2332,7 @@ def build_job_payload(
         "mime_type": mime_type,
         "usuario_proceso": request.usuario_proceso,
         "job_proceso": request.job_proceso,
-        "job_filde_id": request.job_filde_id,
+        "job_filde_id": request.job_field_id or request.job_filde_id,
         "queue_name": DEFAULT_QUEUE_NAME,
         "overwrite_enabled": request.overwrite.enabled,
         "allow_duplicate_hash": request.overwrite.allow_duplicate_hash,
@@ -2558,13 +2558,12 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         {"file_name": file_name},
                     )
 
-            # Resuelve documentoId real (FK).
-            # Si el caller ya resolvió documento_id (path rápido), se usa directamente.
-            # Si no, se resuelve por metadatosExtra.ocr.metadata.oid y fallback por archivoNombre.
-            documento_info = None
+            # Resuelve documentoId real (FK): prioriza el valor provisto por el caller,
+            # luego busca por OID en metadatosExtra y por nombre de archivo como fallback.
             caller_documento_id = safe_int(request.documento_id, None)
             if caller_documento_id is not None:
                 documento_id = caller_documento_id
+                documento_info = {"documento_id": caller_documento_id}
                 recorder.push(
                     "LOAD_DOCUMENT",
                     "OK",
@@ -2613,22 +2612,6 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         {"oid": int(request.oid)},
                     )
 
-            # Fallo temprano: si save_to_db=true y documentoId no resuelto, no tiene sentido gastar GPU.
-            if documento_id is None and run_persist_stage and request.embedding.save_to_db:
-                raise PipelineError(
-                    "LOAD_DOCUMENT",
-                    "MISSING_REQUIRED_DOCUMENTO_ID",
-                    "documentoId no resuelto y embedding.save_to_db=true; abortando antes del OCR para evitar desperdicio de GPU.",
-                    {
-                        "oid": int(request.oid),
-                        "file_name": file_name,
-                        "hint": (
-                            "Pase documento_id en el request, o asegurese de que GestorDocumental.Documentos "
-                            "tenga el registro antes de llamar al pipeline."
-                        ),
-                    },
-                )
-
             # Reproceso de documento en estado PROCESADO.
             if documento_id is not None:
                 estado_actual = safe_str((documento_info or {}).get("estado_documento"), "").strip().upper()
@@ -2676,6 +2659,19 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                     mime_support_info,
                 )
             recorder.push("MIME_VALIDATION", "OK", "Mime type validado.", mime_support_info)
+
+            # Early-fail: si save_to_db=true y documentoId no fue resuelto, abortar antes del OCR.
+            if documento_id is None and run_persist_stage and request.embedding.save_to_db:
+                raise PipelineError(
+                    "LOAD_DOCUMENT",
+                    "MISSING_REQUIRED_DOCUMENTO_ID",
+                    "documentoId no resuelto y embedding.save_to_db=true; abortando antes del OCR para evitar desperdicio de GPU.",
+                    {
+                        "oid": int(request.oid),
+                        "file_name": file_name,
+                        "hint": "Proveer documento_id en el payload o asegurarse de que el documento exista en GestorDocumental.Documentos con el OID en metadatosExtra.",
+                    },
+                )
 
             if request.queue.enabled:
                 queue_info = db.ensure_queue(
@@ -4617,4 +4613,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

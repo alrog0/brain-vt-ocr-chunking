@@ -1,19 +1,19 @@
 # =============================================================================
 # Brain VT - OCR Chunking Embeddings Service
 # Python 3.10+
-# =============================================================================
 #
-# PASO 1 - Instalar PyTorch con CUDA (segun GPU destino):
+# Mapeo: fitz -> pymupdf; docling_core -> docling-core
 #
-#   RTX A6000 Ampere (sm_86) - PRODUCCION:
+# PASO 1 - Instalar PyTorch con CUDA (según GPU destino):
+#   RTX A6000 Ampere (sm_86) - PRODUCCIÓN:
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-#
 #   RTX 5090 Blackwell (sm_120) - DESARROLLO:
 #     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 #
 # PASO 2 - Instalar dependencias:
-#     pip install -r requirements.txt
+#   pip install -r requirements.txt
 #
+# NOTA: torch/torchvision se instalan separados con CUDA, ver arriba.
 # =============================================================================
 
 # --- API ---
@@ -27,7 +27,6 @@ PyJWT[crypto]==2.12.1
 psycopg2-binary==2.9.11
 
 # --- ML / Embeddings ---
-# torch y torchvision se instalan aparte con CUDA (ver PASO 1)
 transformers==4.57.6
 accelerate==1.13.0
 sentencepiece==0.2.1
@@ -46,5 +45,6 @@ pymupdf==1.27.2.2
 Pillow==12.1.1
 rapidocr==3.7.0
 
-# --- Numerico ---
+# --- Numérico ---
 numpy==2.4.3
+
