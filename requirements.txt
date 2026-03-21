@@ -1,24 +1,32 @@
-# Brain VT – OCR Chunking Embeddings service
+# =============================================================================
+# Brain VT - OCR Chunking Embeddings Service
 # Python 3.10+
+#
 # Mapeo: fitz -> pymupdf; docling_core -> docling-core
 #
-# Instalar PyTorch con CUDA (ajustar cu126 según GPU destino):
-#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
-# Luego instalar el resto:
+# PASO 1 - Instalar PyTorch con CUDA (según GPU destino):
+#   RTX A6000 Ampere (sm_86) - PRODUCCIÓN:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+#   RTX 5090 Blackwell (sm_120) - DESARROLLO:
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+#
+# PASO 2 - Instalar dependencias:
 #   pip install -r requirements.txt
+#
+# NOTA: torch/torchvision se instalan separados con CUDA, ver arriba.
+# =============================================================================
 
-# API
+# --- API ---
 fastapi==0.135.1
-uvicorn[standard]==0.41.0
+uvicorn[standard]==0.42.0
 pydantic==2.12.5
-python-multipart>=0.0.6
+python-multipart==0.0.22
 PyJWT[crypto]==2.12.1
 
-# Base de datos
+# --- Base de datos ---
 psycopg2-binary==2.9.11
 
-# ML / embeddings (torch se instala aparte con CUDA, ver arriba)
-# torch==2.10.0+cu126
+# --- ML / Embeddings ---
 transformers==4.57.6
 accelerate==1.13.0
 sentencepiece==0.2.1
@@ -26,14 +34,17 @@ huggingface-hub==0.36.2
 safetensors==0.7.0
 tokenizers==0.22.2
 
-# OCR y documento (docling, fitz = pymupdf)
-docling==2.77.0
-docling-core==2.68.0
-docling-ibm-models==3.11.0
-docling-parse==5.5.0
-pymupdf==1.27.1
-Pillow==12.0.0
+# --- OCR y procesamiento documental ---
+# docling usa RapidOCR con backend torch para GPU OCR
+# (no requiere onnxruntime-gpu)
+docling==2.81.0
+docling-core==2.70.2
+docling-ibm-models==3.12.0
+docling-parse==5.6.0
+pymupdf==1.27.2.2
+Pillow==12.1.1
 rapidocr==3.7.0
 
-# Numérico
-numpy==2.3.5
+# --- Numérico ---
+numpy==2.4.3
+
