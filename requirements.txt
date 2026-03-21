@@ -1,28 +1,39 @@
 # Brain VT – OCR Chunking Embeddings service
 # Python 3.10+
 # Mapeo: fitz -> pymupdf; docling_core -> docling-core
+#
+# Instalar PyTorch con CUDA (ajustar cu126 según GPU destino):
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+# Luego instalar el resto:
+#   pip install -r requirements.txt
 
 # API
-fastapi>=0.100.0
-uvicorn[standard]>=0.22.0
-pydantic>=2.0.0
+fastapi==0.135.1
+uvicorn[standard]==0.41.0
+pydantic==2.12.5
 python-multipart>=0.0.6
-PyJWT[crypto]>=2.8.0
+PyJWT[crypto]==2.12.1
 
 # Base de datos
-psycopg2-binary>=2.9.0
+psycopg2-binary==2.9.11
 
-# ML / embeddings (torch, transformers)
-torch>=2.0.0
-transformers>=4.30.0
-accelerate>=0.20.0
-sentencepiece>=0.1.99
-huggingface-hub>=0.19.0
+# ML / embeddings (torch se instala aparte con CUDA, ver arriba)
+# torch==2.10.0+cu126
+transformers==4.57.6
+accelerate==1.13.0
+sentencepiece==0.2.1
+huggingface-hub==0.36.2
+safetensors==0.7.0
+tokenizers==0.22.2
 
 # OCR y documento (docling, fitz = pymupdf)
-docling>=2.0.0
-docling-core>=0.1.0
-pymupdf>=1.23.0
+docling==2.77.0
+docling-core==2.68.0
+docling-ibm-models==3.11.0
+docling-parse==5.5.0
+pymupdf==1.27.1
+Pillow==12.0.0
+rapidocr==3.7.0
 
-# Numérico (usado por torch/docling/transformers)
-numpy>=1.24.0
+# Numérico
+numpy==2.3.5
