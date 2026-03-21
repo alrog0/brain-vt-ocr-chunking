@@ -19,11 +19,16 @@ Run local mock demo (no DB):
 from __future__ import annotations
 
 import argparse
+import glob as glob_mod
 import hashlib
 import json
 import logging
 import os
+import pathlib
+import platform
 import re
+import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -40,12 +45,15 @@ import psycopg2
 import torch
 import torch.nn.functional as torch_functional
 import uvicorn
-from docling.datamodel.base_models import ConversionStatus
-from docling.datamodel.pipeline_options import PdfPipelineOptions
+from docling.datamodel.accelerator_options import AcceleratorDevice, AcceleratorOptions
+from docling.datamodel.base_models import ConversionStatus, InputFormat
+from docling.datamodel.pipeline_options import PdfPipelineOptions, RapidOcrOptions, ThreadedPdfPipelineOptions
+from docling.datamodel.settings import settings as docling_settings
 from docling.document_converter import DocumentConverter, PdfFormatOption
+from docling.pipeline.threaded_standard_pdf_pipeline import ThreadedStandardPdfPipeline
 from docling_core.transforms.chunker.hybrid_chunker import HybridChunker
 from docling_core.types.doc import DocItemLabel, DoclingDocument
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Security, UploadFile
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jwt.jwks_client import PyJWKClient
 from jwt.exceptions import ExpiredSignatureError, InvalidIssuerError, InvalidTokenError
@@ -61,6 +69,9 @@ TAG_EMBEDDING = "Segmento Embedding"
 TAG_OCR = "Segmento Docling-OCR"
 TAG_PIPELINE = "Segmento Pipeline"
 TAG_HELPERS = "Segmento Helpers"
+TAG_INFRA = "Segmento Infraestructura"
+TAG_VALIDATION = "Segmento Validacion Integral"
+TAG_LOGS = "Segmento Logs"
 
 OPENAPI_TAGS = [
     {"name": TAG_CHUNKING, "description": "Metodos de chunking (texto a chunks)."},
@@ -68,6 +79,9 @@ OPENAPI_TAGS = [
     {"name": TAG_OCR, "description": "Metodos de OCR y extraccion de texto."},
     {"name": TAG_PIPELINE, "description": "Metodos de orquestacion completa PipelineOCR."},
     {"name": TAG_HELPERS, "description": "Endpoints auxiliares: auth/login, health, example-request, validate-db."},
+    {"name": TAG_INFRA, "description": "Diagnostico de infraestructura: GPU, librerias, compatibilidad CUDA."},
+    {"name": TAG_VALIDATION, "description": "Validacion integral del pipeline con upload de archivos de prueba."},
+    {"name": TAG_LOGS, "description": "Consulta de logs estructurados del servicio."},
 ]
 
 DEFAULT_QUEUE_NAME = "BRAINVT_OCR_EMBEDDINGS_GPU"
@@ -87,11 +101,17 @@ SERVICE_STAGE_ENDPOINTS = {
     "embedding": "/embedding-generation/process",
     "pipeline": "/PipelineOCR/process",
 }
+# ---------------------------------------------------------------------------
+# Supported formats — aligned with docling 2.81 InputFormat enum (17 formats)
+# ---------------------------------------------------------------------------
 SUPPORTED_DOCLING_MIME_TYPES = {
+    # PDF
     "application/pdf",
+    # Office Open XML
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # Markup / text
     "text/markdown",
     "text/x-markdown",
     "text/asciidoc",
@@ -101,11 +121,27 @@ SUPPORTED_DOCLING_MIME_TYPES = {
     "text/html",
     "application/xhtml+xml",
     "text/csv",
+    # Images
     "image/png",
     "image/jpeg",
     "image/tiff",
     "image/bmp",
     "image/webp",
+    # Audio (requires docling[asr])
+    "audio/wav",
+    "audio/x-wav",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/aac",
+    "audio/ogg",
+    "audio/flac",
+    # Subtitles
+    "text/vtt",
+    # XML schemas
+    "application/xml",
+    "text/xml",
+    # Docling JSON (re-import)
+    "application/json",
 }
 MIME_TO_EXTENSION = {
     "application/pdf": ".pdf",
@@ -126,6 +162,17 @@ MIME_TO_EXTENSION = {
     "image/tiff": ".tiff",
     "image/bmp": ".bmp",
     "image/webp": ".webp",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/mpeg": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/flac": ".flac",
+    "text/vtt": ".vtt",
+    "application/xml": ".xml",
+    "text/xml": ".xml",
+    "application/json": ".json",
 }
 EXTENSION_TO_MIME = {
     ".pdf": "application/pdf",
@@ -137,6 +184,7 @@ EXTENSION_TO_MIME = {
     ".adoc": "text/asciidoc",
     ".asciidoc": "text/asciidoc",
     ".tex": "text/x-tex",
+    ".latex": "text/x-tex",
     ".html": "text/html",
     ".htm": "text/html",
     ".xhtml": "application/xhtml+xml",
@@ -148,6 +196,15 @@ EXTENSION_TO_MIME = {
     ".tiff": "image/tiff",
     ".bmp": "image/bmp",
     ".webp": "image/webp",
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".vtt": "text/vtt",
+    ".xml": "application/xml",
+    ".json": "application/json",
 }
 
 PAGE_INDICATOR_PATTERN = re.compile(
@@ -157,6 +214,19 @@ PAGE_INDICATOR_PATTERN = re.compile(
 ISOLATED_NUMBER_PATTERN = re.compile(r"^[\d\s\.,\-/]+$")
 MULTI_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
 WORD_TOKEN_PATTERN = re.compile(r"[A-Za-zÁÉÍÓÚáéíóúÜüÑñ]+", re.UNICODE)
+
+# ---------------------------------------------------------------------------
+# Large-document processing: chunk PDFs into blocks of N pages to avoid
+# std::bad_alloc in docling-parse and to enable per-block GC.
+# Env OCR_PAGE_CHUNK_SIZE=0 disables chunking (process full doc at once).
+# ---------------------------------------------------------------------------
+PAGE_CHUNK_SIZE = int(os.getenv("OCR_PAGE_CHUNK_SIZE", "50"))
+PAGE_CHUNK_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "300"))
+
+# Configure docling global performance settings for GPU throughput.
+# page_batch_size controls how many pages are sent to GPU models at once.
+docling_settings.perf.page_batch_size = 64
+docling_settings.perf.page_batch_concurrency = 2
 
 LOGGER = logging.getLogger("ocr_chunking")
 if not LOGGER.handlers:
@@ -172,6 +242,8 @@ _MODEL_LOCK = Lock()
 _TOKENIZER_LOCK = Lock()
 _DOCLING_LOCK = Lock()
 _JWK_CLIENT: Optional[PyJWKClient] = None
+_AUTH_SETTINGS_CACHE: Optional["AuthSettings"] = None
+_PG_SETTINGS_CACHE: Optional["PostgresSettings"] = None
 _BEARER_SCHEME = HTTPBearer(
     auto_error=False,
     description="JWT Bearer emitido por Keycloak para acceder al servicio.",
@@ -192,10 +264,13 @@ class AuthSettings:
 
     @staticmethod
     def from_env() -> "AuthSettings":
-        """Loads JWT auth settings from environment."""
+        """Loads JWT auth settings from environment (cached after first call)."""
+        global _AUTH_SETTINGS_CACHE
+        if _AUTH_SETTINGS_CACHE is not None:
+            return _AUTH_SETTINGS_CACHE
         algorithms_raw = safe_str(os.getenv("OCR_JWT_ALGORITHMS", "RS256"), "RS256")
         algorithms = [item.strip() for item in algorithms_raw.split(",") if item.strip()]
-        return AuthSettings(
+        _AUTH_SETTINGS_CACHE = AuthSettings(
             enabled=safe_bool(os.getenv("OCR_AUTH_ENABLED", str(DEFAULT_AUTH_ENABLED).lower()), DEFAULT_AUTH_ENABLED),
             issuer=safe_str(os.getenv("OCR_JWT_ISSUER", DEFAULT_JWT_ISSUER), DEFAULT_JWT_ISSUER).strip(),
             jwks_url=safe_str(os.getenv("OCR_JWKS_URL", DEFAULT_JWKS_URL), DEFAULT_JWKS_URL).strip(),
@@ -208,10 +283,11 @@ class AuthSettings:
             or None,
             algorithms=algorithms or ["RS256"],
         )
+        return _AUTH_SETTINGS_CACHE
 
 def utc_now_iso() -> str:
     """Returns UTC timestamp as ISO string."""
-    return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def safe_str(value: Any, default: str = "") -> str:
@@ -360,17 +436,13 @@ def is_supported_docling_mime(mime_type: str) -> bool:
 
 
 def pydantic_model_dump(model: BaseModel) -> Dict[str, Any]:
-    """Pydantic v1/v2 compatibility."""
-    if hasattr(model, "model_dump"):
-        return model.model_dump()
-    return model.dict()
+    """Serializes Pydantic model to dict."""
+    return model.model_dump()
 
 
 def pydantic_model_dump_json(model: BaseModel, *, indent: int = 2) -> str:
-    """Pydantic v1/v2 compatibility for JSON dump."""
-    if hasattr(model, "model_dump_json"):
-        return model.model_dump_json(indent=indent)
-    return model.json(indent=indent, ensure_ascii=False)
+    """Serializes Pydantic model to JSON string."""
+    return model.model_dump_json(indent=indent)
 
 def _auth_error_detail(code: str, message: str, details: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Builds standardized auth error payload."""
@@ -611,14 +683,18 @@ class PostgresSettings:
 
     @staticmethod
     def from_env() -> "PostgresSettings":
-        """Loads DB settings from environment."""
-        return PostgresSettings(
+        """Loads DB settings from environment (cached after first call)."""
+        global _PG_SETTINGS_CACHE
+        if _PG_SETTINGS_CACHE is not None:
+            return _PG_SETTINGS_CACHE
+        _PG_SETTINGS_CACHE = PostgresSettings(
             host=os.getenv("OCR_DB_HOST", "localhost"),
             port=int(os.getenv("OCR_DB_PORT", "5432")),
             dbname=os.getenv("OCR_DB_NAME", "niledb"),
             user=os.getenv("OCR_DB_USER", "postgres"),
             password=os.getenv("OCR_DB_PASSWORD", "plexia"),
         )
+        return _PG_SETTINGS_CACHE
 
 
 def bogota_now_iso() -> str:
@@ -1534,42 +1610,80 @@ def load_tokenizer(model_name: str) -> Any:
 
 
 def load_embedding_model(model_name: str) -> Tuple[Any, Any, str]:
-    """Loads tokenizer/model/device with in-memory cache."""
+    """Loads tokenizer/model/device with in-memory cache.
+
+    Uses float16 on CUDA to halve VRAM usage (sufficient for embedding inference).
+    """
     with _MODEL_LOCK:
         cached = _MODEL_CACHE.get(model_name)
         if cached is not None:
             return cached
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        model = AutoModel.from_pretrained(model_name)
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.float16 if device == "cuda" else torch.float32
+        model = AutoModel.from_pretrained(model_name, dtype=dtype)
         model = model.to(device)
         model.eval()
         _MODEL_CACHE[model_name] = (tokenizer, model, device)
         return tokenizer, model, device
 
 
+def _build_accelerator_options() -> AcceleratorOptions:
+    """Builds AcceleratorOptions: CUDA if available, else CPU."""
+    device = AcceleratorDevice.CUDA if torch.cuda.is_available() else AcceleratorDevice.CPU
+    return AcceleratorOptions(device=device)
+
+
 def load_docling_converter(force_full_page_ocr: bool, do_table_structure: bool, images_scale: float) -> Any:
-    """Loads Docling converter with option-key cache."""
+    """Loads Docling converter with GPU acceleration following official docling guide.
+
+    Uses ThreadedPdfPipelineOptions with RapidOCR torch backend for GPU OCR,
+    AcceleratorOptions for layout/table models, and tuned batch sizes.
+    See: https://docling-project.github.io/docling/usage/gpu/
+    """
     key = f"{int(force_full_page_ocr)}|{int(do_table_structure)}|{images_scale:.3f}"
     with _DOCLING_LOCK:
         cached = _DOCLING_CONVERTER_CACHE.get(key)
         if cached is not None:
             return cached
-        options = PdfPipelineOptions()
-        options.do_ocr = True
-        options.do_table_structure = bool(do_table_structure)
-        options.images_scale = float(images_scale)
-        options.generate_page_images = False
-        options.generate_picture_images = False
-        if hasattr(options, "ocr_options") and options.ocr_options is not None:
-            setattr(options.ocr_options, "force_full_page_ocr", bool(force_full_page_ocr))
-        converter = DocumentConverter(format_options={"pdf": PdfFormatOption(pipeline_options=options)})
+
+        use_gpu = torch.cuda.is_available()
+
+        # RapidOCR with torch backend is the only known working GPU OCR setup.
+        ocr_options = RapidOcrOptions(
+            backend="torch" if use_gpu else "onnxruntime",
+            force_full_page_ocr=bool(force_full_page_ocr),
+        )
+
+        options = ThreadedPdfPipelineOptions(
+            do_ocr=True,
+            do_table_structure=bool(do_table_structure),
+            images_scale=float(images_scale),
+            generate_page_images=False,
+            generate_picture_images=False,
+            ocr_options=ocr_options,
+            accelerator_options=_build_accelerator_options(),
+            document_timeout=PAGE_CHUNK_DOCUMENT_TIMEOUT if PAGE_CHUNK_DOCUMENT_TIMEOUT > 0 else None,
+            # Batch sizes: increase for GPU, keep low for CPU.
+            ocr_batch_size=64 if use_gpu else 4,
+            layout_batch_size=64 if use_gpu else 4,
+            table_batch_size=4,
+        )
+
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(
+                    pipeline_cls=ThreadedStandardPdfPipeline,
+                    pipeline_options=options,
+                ),
+            },
+        )
         _DOCLING_CONVERTER_CACHE[key] = converter
         return converter
 
 
 def load_docling_converter_generic() -> Any:
-    """Loads generic Docling converter (no formato fijo)."""
+    """Loads generic Docling converter (no formato fijo) with GPU if available."""
     key = "GENERIC_DEFAULT"
     with _DOCLING_LOCK:
         cached = _DOCLING_CONVERTER_CACHE.get(key)
@@ -1586,25 +1700,22 @@ def apply_page_selection(pdf_bytes: bytes, page_mode: str, head_pages: int, tail
     if mode not in {"full", "head_tail"}:
         raise PipelineError("PAGE_SELECTION", "INVALID_PAGE_MODE", "page_mode invalido", {"page_mode": mode})
     if mode == "full":
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        total_pages = int(doc.page_count)
-        doc.close()
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            total_pages = int(doc.page_count)
         return pdf_bytes, {"mode": "full", "total_pages": total_pages, "selected_pages": total_pages}
 
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = int(doc.page_count)
-    head_n = max(1, int(head_pages))
-    tail_n = max(1, int(tail_pages))
-    front = list(range(min(head_n, total_pages)))
-    back = list(range(max(total_pages - tail_n, 0), total_pages))
-    selected_indexes = sorted(set(front + back))
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total_pages = int(doc.page_count)
+        head_n = max(1, int(head_pages))
+        tail_n = max(1, int(tail_pages))
+        front = list(range(min(head_n, total_pages)))
+        back = list(range(max(total_pages - tail_n, 0), total_pages))
+        selected_indexes = sorted(set(front + back))
 
-    out_doc = fitz.open()
-    for idx in selected_indexes:
-        out_doc.insert_pdf(doc, from_page=idx, to_page=idx)
-    selected_pdf = out_doc.tobytes(garbage=4, deflate=True)
-    out_doc.close()
-    doc.close()
+        with fitz.open() as out_doc:
+            for idx in selected_indexes:
+                out_doc.insert_pdf(doc, from_page=idx, to_page=idx)
+            selected_pdf = out_doc.tobytes(garbage=4, deflate=True)
 
     return selected_pdf, {
         "mode": "head_tail",
@@ -1618,23 +1729,22 @@ def apply_page_selection(pdf_bytes: bytes, page_mode: str, head_pages: int, tail
 
 def probe_pdf_extractability(pdf_bytes: bytes, max_pages: int) -> Dict[str, Any]:
     """Probes text extractability and image presence with PyMuPDF."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    total_pages = int(doc.page_count)
-    sample_n = min(total_pages, max(1, int(max_pages)))
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total_pages = int(doc.page_count)
+        sample_n = min(total_pages, max(1, int(max_pages)))
 
-    pages_with_text = 0
-    pages_with_images = 0
-    total_chars = 0
-    for idx in range(sample_n):
-        page = doc.load_page(idx)
-        page_text = page.get_text("text") or ""
-        page_chars = len(page_text.strip())
-        if page_chars > 20:
-            pages_with_text += 1
-        if len(page.get_images(full=True)) > 0:
-            pages_with_images += 1
-        total_chars += page_chars
-    doc.close()
+        pages_with_text = 0
+        pages_with_images = 0
+        total_chars = 0
+        for idx in range(sample_n):
+            page = doc.load_page(idx)
+            page_text = page.get_text("text") or ""
+            page_chars = len(page_text.strip())
+            if page_chars > 20:
+                pages_with_text += 1
+            if len(page.get_images(full=True)) > 0:
+                pages_with_images += 1
+            total_chars += page_chars
 
     text_page_ratio = float(pages_with_text) / float(sample_n) if sample_n > 0 else 0.0
     avg_chars_per_page = float(total_chars) / float(sample_n) if sample_n > 0 else 0.0
@@ -1659,13 +1769,12 @@ def probe_pdf_extractability(pdf_bytes: bytes, max_pages: int) -> Dict[str, Any]
 
 def extract_text_pymupdf(pdf_bytes: bytes) -> Tuple[str, int]:
     """Extracts text with PyMuPDF."""
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page_count = int(doc.page_count)
-    parts: List[str] = []
-    for idx in range(page_count):
-        page = doc.load_page(idx)
-        parts.append(page.get_text("text") or "")
-    doc.close()
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        page_count = int(doc.page_count)
+        parts: List[str] = []
+        for idx in range(page_count):
+            page = doc.load_page(idx)
+            parts.append(page.get_text("text") or "")
     return "\n\n".join(parts).strip(), page_count
 
 
@@ -1732,8 +1841,75 @@ def extract_docling_confidence_bundle(result: Any) -> Dict[str, Any]:
     }
 
 
+def _split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[bytes, int, int]]:
+    """Splits a PDF into page-range chunks using PyMuPDF.
+
+    Returns list of (chunk_bytes, start_page_0based, end_page_0based).
+    Each chunk has at most `chunk_size` pages.
+    """
+    chunks: List[Tuple[bytes, int, int]] = []
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        total = doc.page_count
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total) - 1
+            with fitz.open() as out:
+                out.insert_pdf(doc, from_page=start, to_page=end)
+                chunks.append((out.tobytes(garbage=4, deflate=True), start, end))
+    return chunks
+
+
+def _convert_single_block(converter: Any, block_bytes: bytes, suffix: str) -> Tuple[str, int, Dict[str, Any]]:
+    """Runs docling converter on a single PDF block and returns (text, pages, meta)."""
+    temp = tempfile.NamedTemporaryFile(prefix="docling_blk_", suffix=suffix, delete=False)
+    temp_path = temp.name
+    temp.write(block_bytes)
+    temp.flush()
+    temp.close()
+    try:
+        result = converter.convert(temp_path)
+        status = getattr(result, "status", None)
+        status_str = safe_str(status, "")
+        success = (
+            status == ConversionStatus.SUCCESS
+            or status_str.endswith("SUCCESS")
+            or status_str.endswith("PARTIAL_SUCCESS")
+        )
+        if not success:
+            raise PipelineError(
+                "TEXT_EXTRACTION", "DOCLING_CONVERSION_FAILED",
+                "Docling no pudo convertir el bloque.",
+                {"status": status_str},
+            )
+        document = getattr(result, "document", None)
+        if document is None:
+            return "", 0, {"conversion_status": status_str}
+
+        text = safe_str(getattr(document, "export_to_markdown", lambda: "")(), "")
+        if not text.strip():
+            text = safe_str(getattr(document, "export_to_text", lambda: "")(), "")
+        page_count = int(len(getattr(document, "pages", []) or []))
+        confidence_bundle = extract_docling_confidence_bundle(result)
+        return text.strip(), page_count, {
+            "conversion_status": status_str,
+            "docling_confidence": confidence_bundle,
+            "ocr_quality": safe_float(
+                (confidence_bundle.get("summary") or {}).get("selected_quality"), None,
+            ),
+        }
+    finally:
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+
 def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mime_type: str, file_name: str) -> Tuple[str, int, Dict[str, Any]]:
-    """Extracts text/OCR with Docling for supported mime types."""
+    """Extracts text/OCR with Docling for supported mime types.
+
+    For large PDFs (> PAGE_CHUNK_SIZE pages), the document is split into
+    page-range blocks processed independently. This prevents std::bad_alloc
+    in docling-parse and allows garbage collection between blocks.
+    """
     normalized_mime = normalize_mime_type(mime_type)
     is_pdf = normalized_mime == "application/pdf"
     if is_pdf:
@@ -1749,48 +1925,68 @@ def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mim
     if not suffix:
         _, ext = os.path.splitext(normalize_file_name(file_name))
         suffix = ext if ext else ".bin"
-    temp = tempfile.NamedTemporaryFile(prefix="docling_ocr_", suffix=suffix, delete=False)
-    temp_path = temp.name
-    temp.write(binary_bytes)
-    temp.flush()
-    temp.close()
-    try:
-        result = converter.convert(temp_path)
-        status = getattr(result, "status", None)
-        status_str = safe_str(status, "")
-        success = status == ConversionStatus.SUCCESS or status_str.endswith("SUCCESS")
-        if not success:
-            raise PipelineError(
-                "TEXT_EXTRACTION",
-                "DOCLING_CONVERSION_FAILED",
-                "Docling no pudo convertir el PDF.",
-                {"status": status_str},
-            )
 
-        document = getattr(result, "document", None)
-        if document is None:
-            raise PipelineError(
-                "TEXT_EXTRACTION",
-                "DOCLING_RESULT_EMPTY",
-                "Docling no devolvio documento.",
+    # --- Chunked processing for large PDFs ---
+    if is_pdf and PAGE_CHUNK_SIZE > 0:
+        with fitz.open(stream=binary_bytes, filetype="pdf") as doc:
+            total_pages = doc.page_count
+
+        if total_pages > PAGE_CHUNK_SIZE:
+            LOGGER.info(
+                "Large PDF detected (%d pages). Splitting into chunks of %d pages.",
+                total_pages, PAGE_CHUNK_SIZE,
             )
-        text = safe_str(getattr(document, "export_to_markdown", lambda: "")(), "")
-        if not text.strip():
-            text = safe_str(getattr(document, "export_to_text", lambda: "")(), "")
-        page_count = int(len(getattr(document, "pages", []) or []))
-        confidence_bundle = extract_docling_confidence_bundle(result)
-        return text.strip(), page_count, {
-            "conversion_status": status_str,
-            "conversion_mode": "docling_ocr" if is_pdf else "docling_extract",
-            "mime_type": normalized_mime,
-            "docling_confidence": confidence_bundle,
-            "ocr_quality": safe_float((confidence_bundle.get("summary") or {}).get("selected_quality"), None),
-        }
-    finally:
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
+            chunks = _split_pdf_into_chunks(binary_bytes, PAGE_CHUNK_SIZE)
+            all_texts: List[str] = []
+            total_extracted_pages = 0
+            last_meta: Dict[str, Any] = {}
+
+            for i, (chunk_bytes, start_pg, end_pg) in enumerate(chunks):
+                LOGGER.info(
+                    "Processing chunk %d/%d (pages %d-%d)...",
+                    i + 1, len(chunks), start_pg + 1, end_pg + 1,
+                )
+                try:
+                    text, pages, meta = _convert_single_block(converter, chunk_bytes, suffix)
+                    if text:
+                        all_texts.append(text)
+                    total_extracted_pages += pages
+                    last_meta = meta
+                except PipelineError:
+                    LOGGER.warning(
+                        "Chunk %d/%d failed (pages %d-%d), skipping.",
+                        i + 1, len(chunks), start_pg + 1, end_pg + 1,
+                    )
+                # Allow GC to reclaim docling-parse C++ memory between chunks.
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            combined_text = "\n\n".join(all_texts).strip()
+            if not combined_text:
+                raise PipelineError(
+                    "TEXT_EXTRACTION", "DOCLING_ALL_CHUNKS_EMPTY",
+                    "Ningun bloque produjo texto.",
+                )
+            last_meta.update({
+                "conversion_mode": "docling_ocr_chunked",
+                "mime_type": normalized_mime,
+                "total_pages_original": total_pages,
+                "chunks_processed": len(chunks),
+                "chunk_size": PAGE_CHUNK_SIZE,
+            })
+            return combined_text, total_extracted_pages, last_meta
+
+    # --- Standard single-pass processing ---
+    text, pages, meta = _convert_single_block(converter, binary_bytes, suffix)
+    if not text:
+        raise PipelineError("TEXT_EXTRACTION", "DOCLING_RESULT_EMPTY", "Docling no devolvio texto.")
+    meta.update({
+        "conversion_mode": "docling_ocr" if is_pdf else "docling_extract",
+        "mime_type": normalized_mime,
+    })
+    return text, pages, meta
 
 
 def sentence_is_noisy(sentence: str, min_alpha_tokens: int, short_ratio: float) -> bool:
@@ -2042,6 +2238,7 @@ def embed_chunks(
     tokens_per_chunk: List[int] = []
     step = max(1, int(batch_size))
 
+    use_amp = device == "cuda"
     for idx in range(0, len(chunks), step):
         batch_text = chunks[idx : idx + step]
         encoded = tokenizer(
@@ -2055,13 +2252,17 @@ def embed_chunks(
         if device == "cuda":
             encoded = {k: v.to(device) for k, v in encoded.items()}
             attention_mask = attention_mask.to(device)
-        with torch.no_grad():
-            model_output = model(**encoded)
+        with torch.inference_mode():
+            if use_amp:
+                with torch.amp.autocast("cuda"):
+                    model_output = model(**encoded)
+            else:
+                model_output = model(**encoded)
         pooled = mean_pooling(model_output, attention_mask)
-        normalized = torch_functional.normalize(pooled, p=2, dim=1)
+        normalized = torch_functional.normalize(pooled.float(), p=2, dim=1)
 
-        vectors.extend(normalized.detach().cpu().tolist())
-        token_counts = attention_mask.detach().cpu().sum(dim=1).tolist()
+        vectors.extend(normalized.cpu().tolist())
+        token_counts = attention_mask.cpu().sum(dim=1).tolist()
         tokens_per_chunk.extend([int(x) for x in token_counts])
     return vectors, tokens_per_chunk
 
@@ -3234,10 +3435,23 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
 
 def process_request(request: OCRChunkingRequest, stage: str = "pipeline") -> OCRChunkingResponse:
-    """Selects mock or real pipeline execution by stage."""
+    """Selects mock or real pipeline execution by stage. Writes structured log."""
     if request.mock.enabled:
         return run_mock_pipeline(request)
-    return run_real_pipeline(request, stage=stage)
+    response = run_real_pipeline(request, stage=stage)
+    try:
+        write_pipeline_log(
+            oid=int(request.oid),
+            stage=stage,
+            status=response.status,
+            phases=response.phases,
+            data=response.data,
+            error=response.error,
+            source="pipeline",
+        )
+    except Exception:
+        LOGGER.debug("No se pudo escribir log de pipeline para oid=%s", request.oid, exc_info=True)
+    return response
 
 def process_batch(request: OCRChunkingBatchRequest, stage: str = "pipeline") -> OCRChunkingBatchResponse:
     """Processes a batch of requests sequentially or in parallel."""
@@ -3360,6 +3574,874 @@ def validate_db(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, 
     if safe_str(result.get("status"), "").lower() != "ok":
         raise HTTPException(status_code=403, detail=to_json_safe(result))
     return to_json_safe(result)
+
+
+KNOWN_GPU_ARCHITECTURES: Dict[str, Dict[str, Any]] = {
+    "sm_50": {"family": "Maxwell",  "example": "GTX 950/960"},
+    "sm_60": {"family": "Pascal",   "example": "GP100, Tesla P100"},
+    "sm_61": {"family": "Pascal",   "example": "GTX 1080, Tesla P40"},
+    "sm_70": {"family": "Volta",    "example": "Tesla V100"},
+    "sm_75": {"family": "Turing",   "example": "RTX 2080, T4"},
+    "sm_80": {"family": "Ampere",   "example": "A100"},
+    "sm_86": {"family": "Ampere",   "example": "RTX 3090, RTX A6000"},
+    "sm_89": {"family": "Ada Lovelace", "example": "RTX 4090, L40"},
+    "sm_90": {"family": "Hopper",   "example": "H100, H200"},
+    "sm_100": {"family": "Blackwell", "example": "B100, B200"},
+    "sm_120": {"family": "Blackwell", "example": "RTX 5090, RTX 5080"},
+}
+
+REQUIRED_LIBRARIES: Dict[str, str] = {
+    "torch": "torch",
+    "transformers": "transformers",
+    "docling": "docling",
+    "docling-core": "docling_core",
+    "docling-ibm-models": "docling_ibm_models",
+    "docling-parse": "docling_parse",
+    "rapidocr": "rapidocr",
+    "onnxruntime": "onnxruntime",
+    "fastapi": "fastapi",
+    "uvicorn": "uvicorn",
+    "pydantic": "pydantic",
+    "pymupdf": "fitz",
+    "numpy": "numpy",
+    "Pillow": "PIL",
+    "accelerate": "accelerate",
+    "huggingface-hub": "huggingface_hub",
+    "psycopg2-binary": "psycopg2",
+    "sentencepiece": "sentencepiece",
+    "safetensors": "safetensors",
+}
+
+
+def _get_lib_version(import_name: str) -> Optional[str]:
+    """Returns installed version of a library or None."""
+    try:
+        mod = sys.modules.get(import_name) or __import__(import_name)
+        ver = getattr(mod, "__version__", None) or getattr(mod, "VERSION", None)
+        if ver:
+            return str(ver)
+        from importlib.metadata import version as meta_version
+        return meta_version(import_name)
+    except Exception:
+        try:
+            from importlib.metadata import version as meta_version
+            return meta_version(import_name)
+        except Exception:
+            return None
+
+
+def _gpu_arch_info(compute_major: int, compute_minor: int) -> Dict[str, Any]:
+    """Returns architecture details for a given compute capability."""
+    sm = f"sm_{compute_major}{compute_minor}"
+    info = KNOWN_GPU_ARCHITECTURES.get(sm, {})
+    return {
+        "compute_capability": f"{compute_major}.{compute_minor}",
+        "sm_code": sm,
+        "family": info.get("family", "unknown"),
+        "example_gpus": info.get("example", "unknown"),
+    }
+
+
+@app.get("/validate-gpu", tags=[TAG_INFRA])
+def validate_gpu(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """
+    Diagnostico completo de GPU: arquitectura, compute capability,
+    compatibilidad con PyTorch y ONNX Runtime, memoria por dispositivo.
+    Pensado para validar RTX A6000 (Ampere, sm_86) en produccion
+    y RTX 5090 (Blackwell, sm_120) en desarrollo.
+    """
+    result: Dict[str, Any] = {
+        "timestamp_utc": utc_now_iso(),
+        "service": SERVICE_NAME,
+        "cuda_available": torch.cuda.is_available(),
+    }
+
+    if not torch.cuda.is_available():
+        result["status"] = "error"
+        result["message"] = "CUDA no disponible. Verificar driver NVIDIA y version de torch."
+        return result
+
+    torch_cuda_version = getattr(torch.version, "cuda", None)
+    torch_arch_list = torch.cuda.get_arch_list() if hasattr(torch.cuda, "get_arch_list") else []
+    device_count = torch.cuda.device_count()
+
+    devices = []
+    all_compatible = True
+    for i in range(device_count):
+        props = torch.cuda.get_device_properties(i)
+        cc_major, cc_minor = props.major, props.minor
+        arch = _gpu_arch_info(cc_major, cc_minor)
+        sm_code = arch["sm_code"]
+        compatible = sm_code in torch_arch_list
+        if not compatible:
+            all_compatible = False
+
+        total_mem = int(props.total_memory)
+        allocated = int(torch.cuda.memory_allocated(i))
+        reserved = int(torch.cuda.memory_reserved(i))
+
+        devices.append({
+            "index": i,
+            "name": props.name,
+            "architecture": arch,
+            "compatible_with_torch": compatible,
+            "memory": {
+                "total_bytes": total_mem,
+                "total_gb": round(total_mem / (1024 ** 3), 2),
+                "allocated_bytes": allocated,
+                "reserved_bytes": reserved,
+                "free_estimate_bytes": max(total_mem - reserved, 0),
+            },
+            "multi_processor_count": props.multi_processor_count,
+        })
+
+    ort_providers: List[str] = []
+    ort_version: Optional[str] = None
+    try:
+        import onnxruntime as ort
+        ort_version = ort.__version__
+        ort_providers = ort.get_available_providers()
+    except ImportError:
+        pass
+
+    result.update({
+        "status": "ok" if all_compatible else "warning",
+        "message": (
+            "Todas las GPU son compatibles con PyTorch."
+            if all_compatible
+            else "Una o mas GPU no tienen kernels en esta build de PyTorch. "
+                 "Verificar version CUDA de torch (cu126/cu128/cu130)."
+        ),
+        "torch": {
+            "version": torch.__version__,
+            "cuda_version": torch_cuda_version,
+            "supported_architectures": torch_arch_list,
+        },
+        "onnxruntime": {
+            "version": ort_version,
+            "available_providers": ort_providers,
+            "gpu_enabled": "CUDAExecutionProvider" in ort_providers,
+        },
+        "device_count": device_count,
+        "devices": devices,
+    })
+    return result
+
+
+@app.get("/validate-libraries", tags=[TAG_INFRA])
+def validate_libraries(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """
+    Reporta versiones instaladas de todas las librerias criticas del servicio.
+    Util para comparar entornos (dev vs produccion) y detectar discrepancias.
+    """
+    libraries: List[Dict[str, Any]] = []
+    missing: List[str] = []
+
+    for pkg_name, import_name in REQUIRED_LIBRARIES.items():
+        version = _get_lib_version(import_name)
+        if version:
+            libraries.append({"package": pkg_name, "import": import_name, "version": version})
+        else:
+            missing.append(pkg_name)
+            libraries.append({"package": pkg_name, "import": import_name, "version": None})
+
+    torch_version = torch.__version__ if hasattr(torch, "__version__") else None
+
+    return {
+        "timestamp_utc": utc_now_iso(),
+        "service": SERVICE_NAME,
+        "service_version": SERVICE_VERSION,
+        "python_version": sys.version,
+        "platform": platform.platform(),
+        "status": "ok" if not missing else "warning",
+        "message": (
+            "Todas las librerias estan instaladas."
+            if not missing
+            else f"Librerias no encontradas: {', '.join(missing)}"
+        ),
+        "torch_build": torch_version,
+        "libraries": libraries,
+        "missing": missing,
+    }
+
+
+@app.get("/validate-cuda-stress", tags=[TAG_INFRA])
+def validate_cuda_stress(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """
+    Ejecuta una prueba rapida de tensor en cada GPU para verificar
+    que los kernels CUDA funcionan correctamente (no solo que se detectan).
+    Detecta el error 'no kernel image is available' antes de procesar documentos.
+    """
+    if not torch.cuda.is_available():
+        return {
+            "timestamp_utc": utc_now_iso(),
+            "status": "error",
+            "message": "CUDA no disponible.",
+            "devices": [],
+        }
+
+    device_count = torch.cuda.device_count()
+    results = []
+    all_ok = True
+
+    for i in range(device_count):
+        device_name = torch.cuda.get_device_name(i)
+        test_result: Dict[str, Any] = {"index": i, "name": device_name}
+        try:
+            t = torch.randn(256, 256, device=f"cuda:{i}")
+            out = torch.mm(t, t)
+            _ = out.sum().item()
+            del t, out
+            torch.cuda.empty_cache()
+            test_result["status"] = "ok"
+            test_result["message"] = "Operacion matmul 256x256 exitosa."
+        except Exception as exc:
+            all_ok = False
+            test_result["status"] = "error"
+            test_result["message"] = str(exc)
+            test_result["error_type"] = type(exc).__name__
+        results.append(test_result)
+
+    return {
+        "timestamp_utc": utc_now_iso(),
+        "status": "ok" if all_ok else "error",
+        "message": (
+            "Todas las GPU pasaron la prueba de stress CUDA."
+            if all_ok
+            else "Una o mas GPU fallaron. Revisar compatibilidad torch/CUDA/driver."
+        ),
+        "device_count": device_count,
+        "devices": results,
+    }
+
+
+@app.get("/validate-environment", tags=[TAG_INFRA])
+def validate_environment(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """
+    Resumen ejecutivo del entorno: sistema operativo, Python, GPU,
+    estado general de librerias y CUDA. Un solo endpoint para
+    validar rapidamente si un nodo esta listo para operar.
+    """
+    gpu_ok = False
+    gpu_summary: List[Dict[str, str]] = []
+    cuda_functional = False
+
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            arch = _gpu_arch_info(props.major, props.minor)
+            compatible = arch["sm_code"] in (torch.cuda.get_arch_list() or [])
+            gpu_summary.append({
+                "index": str(i),
+                "name": props.name,
+                "family": arch["family"],
+                "sm_code": arch["sm_code"],
+                "compatible": str(compatible),
+                "vram_gb": str(round(props.total_memory / (1024 ** 3), 2)),
+            })
+            if compatible:
+                gpu_ok = True
+
+        try:
+            t = torch.randn(16, 16, device="cuda:0")
+            _ = (t @ t).sum().item()
+            del t
+            cuda_functional = True
+        except Exception:
+            cuda_functional = False
+
+    ort_gpu = False
+    try:
+        import onnxruntime as ort
+        ort_gpu = "CUDAExecutionProvider" in ort.get_available_providers()
+    except ImportError:
+        pass
+
+    missing_libs = []
+    for pkg_name, import_name in REQUIRED_LIBRARIES.items():
+        if _get_lib_version(import_name) is None:
+            missing_libs.append(pkg_name)
+
+    all_ok = gpu_ok and cuda_functional and ort_gpu and len(missing_libs) == 0
+
+    return {
+        "timestamp_utc": utc_now_iso(),
+        "service": SERVICE_NAME,
+        "service_version": SERVICE_VERSION,
+        "status": "ok" if all_ok else "warning",
+        "ready_for_production": all_ok,
+        "system": {
+            "os": platform.platform(),
+            "python": sys.version.split()[0],
+            "hostname": platform.node(),
+        },
+        "cuda": {
+            "available": torch.cuda.is_available(),
+            "functional": cuda_functional,
+            "torch_build": torch.__version__,
+            "torch_cuda_version": getattr(torch.version, "cuda", None),
+        },
+        "onnxruntime_gpu": ort_gpu,
+        "gpu_devices": gpu_summary,
+        "missing_libraries": missing_libs,
+        "checks": {
+            "gpu_detected": torch.cuda.is_available(),
+            "gpu_arch_compatible": gpu_ok,
+            "cuda_kernels_functional": cuda_functional,
+            "onnxruntime_gpu_available": ort_gpu,
+            "all_libraries_installed": len(missing_libs) == 0,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Structured file logging system (JSONL)
+# ---------------------------------------------------------------------------
+
+DEFAULT_LOG_DIR = os.path.join(tempfile.gettempdir(), "ocr-chunking-logs")
+LOG_DIR = os.getenv("OCR_LOG_DIR", DEFAULT_LOG_DIR)
+LOG_RETENTION_DAYS = int(os.getenv("OCR_LOG_RETENTION_DAYS", "30"))
+_LOG_WRITE_LOCK = Lock()
+
+
+def _ensure_log_dir(subdir: str = "") -> str:
+    """Creates log directory (cross-platform). Returns the path."""
+    target = os.path.join(LOG_DIR, "ocr-chunking", subdir) if subdir else os.path.join(LOG_DIR, "ocr-chunking")
+    os.makedirs(target, exist_ok=True)
+    return target
+
+
+def _log_base_dir() -> str:
+    """Returns the root log directory for this service."""
+    return _ensure_log_dir()
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_SAFE_FILENAME_RE = re.compile(r"^[\w\-\.]+$")
+
+
+def _safe_log_path(base: str, *parts: str) -> str:
+    """Joins path parts and ensures the result stays within `base`.
+
+    Raises HTTPException(400) if traversal is detected (e.g. '../../etc').
+    """
+    joined = os.path.normpath(os.path.join(base, *parts))
+    real_base = os.path.realpath(base)
+    real_joined = os.path.realpath(joined)
+    if not real_joined.startswith(real_base + os.sep) and real_joined != real_base:
+        raise HTTPException(status_code=400, detail="Ruta de log invalida.")
+    return joined
+
+
+def _today_log_dir() -> str:
+    """Returns today's date subdirectory."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return _ensure_log_dir(today)
+
+
+def write_pipeline_log(
+    oid: Optional[int],
+    stage: str,
+    status: str,
+    phases: List[Dict[str, Any]],
+    data: Optional[Dict[str, Any]] = None,
+    error: Optional[Dict[str, Any]] = None,
+    source: str = "pipeline",
+) -> str:
+    """Writes one pipeline execution log as a JSONL file. Returns the filename."""
+    now = datetime.now(timezone.utc)
+    ts_file = now.strftime("%Y-%m-%dT%H-%M-%S")
+    oid_part = f"_oid-{oid}" if oid is not None else ""
+    filename = f"{source}_{ts_file}{oid_part}.jsonl"
+    day_dir = _today_log_dir()
+    filepath = os.path.join(day_dir, filename)
+
+    log_entry = {
+        "timestamp_utc": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "source": source,
+        "stage": stage,
+        "status": status,
+        "oid": oid,
+        "hostname": platform.node(),
+        "phases": phases,
+        "data": data or {},
+        "error": error,
+    }
+
+    with _LOG_WRITE_LOCK:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(json.dumps(to_json_safe(log_entry), ensure_ascii=False) + "\n")
+
+    # Also write to consolidated error log if failed
+    if status.upper() in {"FAILED", "ERROR"}:
+        error_filename = f"errors_{now.strftime('%Y-%m-%d')}.jsonl"
+        error_filepath = os.path.join(day_dir, error_filename)
+        with _LOG_WRITE_LOCK:
+            with open(error_filepath, "a", encoding="utf-8") as f:
+                f.write(json.dumps(to_json_safe(log_entry), ensure_ascii=False) + "\n")
+
+    return filename
+
+
+def purge_old_logs(retention_days: Optional[int] = None) -> Dict[str, Any]:
+    """Removes log directories older than retention_days. Returns purge summary."""
+    days = retention_days if retention_days is not None else LOG_RETENTION_DAYS
+    cutoff = datetime.now(timezone.utc) - timedelta(days=max(1, days))
+    base = _log_base_dir()
+    removed_dirs: List[str] = []
+    removed_files = 0
+    freed_bytes = 0
+
+    try:
+        for entry in sorted(os.listdir(base)):
+            entry_path = os.path.join(base, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            try:
+                dir_date = datetime.strptime(entry, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if dir_date < cutoff:
+                for f in os.listdir(entry_path):
+                    fp = os.path.join(entry_path, f)
+                    if os.path.isfile(fp):
+                        freed_bytes += os.path.getsize(fp)
+                        removed_files += 1
+                shutil.rmtree(entry_path, ignore_errors=True)
+                removed_dirs.append(entry)
+    except FileNotFoundError:
+        pass
+
+    return {
+        "retention_days": days,
+        "cutoff_date": cutoff.strftime("%Y-%m-%d"),
+        "removed_directories": removed_dirs,
+        "removed_files": removed_files,
+        "freed_bytes": freed_bytes,
+        "freed_mb": round(freed_bytes / (1024 * 1024), 2),
+    }
+
+
+def _list_log_days() -> List[Dict[str, Any]]:
+    """Returns summary per day directory."""
+    base = _log_base_dir()
+    days: List[Dict[str, Any]] = []
+    try:
+        for entry in sorted(os.listdir(base), reverse=True):
+            entry_path = os.path.join(base, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            try:
+                datetime.strptime(entry, "%Y-%m-%d")
+            except ValueError:
+                continue
+            files = [f for f in os.listdir(entry_path) if f.endswith(".jsonl")]
+            total_bytes = sum(os.path.getsize(os.path.join(entry_path, f)) for f in files)
+            error_files = [f for f in files if f.startswith("errors_")]
+            pipeline_files = [f for f in files if not f.startswith("errors_")]
+            days.append({
+                "date": entry,
+                "total_files": len(files),
+                "pipeline_logs": len(pipeline_files),
+                "error_logs": len(error_files),
+                "total_bytes": total_bytes,
+                "total_kb": round(total_bytes / 1024, 2),
+            })
+    except FileNotFoundError:
+        pass
+    return days
+
+
+@app.get("/logs/summary", tags=[TAG_LOGS])
+def logs_summary(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """
+    Resumen global de logs: dias disponibles, total de archivos,
+    espacio en disco, directorio de almacenamiento.
+    """
+    days = _list_log_days()
+    total_files = sum(d["total_files"] for d in days)
+    total_bytes = sum(d["total_bytes"] for d in days)
+    total_errors = sum(d["error_logs"] for d in days)
+    return {
+        "timestamp_utc": utc_now_iso(),
+        "log_directory": os.path.abspath(_log_base_dir()),
+        "retention_days": LOG_RETENTION_DAYS,
+        "total_days": len(days),
+        "total_files": total_files,
+        "total_error_logs": total_errors,
+        "total_bytes": total_bytes,
+        "total_mb": round(total_bytes / (1024 * 1024), 2),
+        "platform": platform.system(),
+        "days": days[:60],
+    }
+
+
+@app.get("/logs/list", tags=[TAG_LOGS])
+def logs_list(
+    date_filter: Optional[str] = Query(None, alias="date", description="Fecha YYYY-MM-DD"),
+    status_filter: Optional[str] = Query(None, alias="status", description="Filtro: error | pipeline | all"),
+    limit: int = Query(100, ge=1, le=1000),
+    _: Dict[str, Any] = Depends(require_service_auth),
+) -> Dict[str, Any]:
+    """
+    Lista archivos de log con filtros opcionales por fecha y tipo.
+    """
+    base = _log_base_dir()
+    target_dates: List[str] = []
+
+    if date_filter:
+        clean_date = date_filter.strip()
+        if not _DATE_RE.match(clean_date):
+            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Use YYYY-MM-DD.")
+        target_dates = [clean_date]
+    else:
+        try:
+            target_dates = sorted(
+                [e for e in os.listdir(base) if _DATE_RE.match(e) and os.path.isdir(_safe_log_path(base, e))],
+                reverse=True,
+            )[:30]
+        except FileNotFoundError:
+            target_dates = []
+
+    results: List[Dict[str, Any]] = []
+    for day in target_dates:
+        day_path = _safe_log_path(base, day)
+        if not os.path.isdir(day_path):
+            continue
+        for fname in sorted(os.listdir(day_path), reverse=True):
+            if not fname.endswith(".jsonl") or not _SAFE_FILENAME_RE.match(fname):
+                continue
+            if status_filter:
+                sf = status_filter.strip().lower()
+                if sf == "error" and not fname.startswith("errors_"):
+                    continue
+                if sf == "pipeline" and fname.startswith("errors_"):
+                    continue
+            fpath = _safe_log_path(base, day, fname)
+            results.append({
+                "date": day,
+                "filename": fname,
+                "size_bytes": os.path.getsize(fpath),
+                "size_kb": round(os.path.getsize(fpath) / 1024, 2),
+            })
+            if len(results) >= limit:
+                break
+        if len(results) >= limit:
+            break
+
+    return {
+        "timestamp_utc": utc_now_iso(),
+        "filters": {"date": date_filter, "status": status_filter},
+        "count": len(results),
+        "files": results,
+    }
+
+
+@app.get("/logs/detail/{filename}", tags=[TAG_LOGS])
+def logs_detail(
+    filename: str,
+    date_filter: Optional[str] = Query(None, alias="date", description="Fecha YYYY-MM-DD del log"),
+    _: Dict[str, Any] = Depends(require_service_auth),
+) -> Dict[str, Any]:
+    """
+    Retorna el contenido de un archivo de log especifico.
+    Si no se pasa date, busca en los ultimos 7 dias.
+    """
+    base = _log_base_dir()
+    clean_name = os.path.basename(filename)
+    if not clean_name or not _SAFE_FILENAME_RE.match(clean_name) or not clean_name.endswith(".jsonl"):
+        raise HTTPException(status_code=400, detail="Nombre de archivo de log invalido.")
+
+    search_dates: List[str] = []
+    if date_filter:
+        clean_date = date_filter.strip()
+        if not _DATE_RE.match(clean_date):
+            raise HTTPException(status_code=400, detail="Formato de fecha invalido. Use YYYY-MM-DD.")
+        search_dates = [clean_date]
+    else:
+        today = datetime.now(timezone.utc)
+        search_dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+    for day in search_dates:
+        fpath = _safe_log_path(base, day, clean_name)
+        if os.path.isfile(fpath):
+            entries: List[Dict[str, Any]] = []
+            with open(fpath, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            entries.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            entries.append({"raw": line})
+            return {
+                "timestamp_utc": utc_now_iso(),
+                "filename": clean_name,
+                "date": day,
+                "size_bytes": os.path.getsize(fpath),
+                "entries_count": len(entries),
+                "entries": entries,
+            }
+
+    raise HTTPException(status_code=404, detail=f"Log '{clean_name}' no encontrado.")
+
+
+@app.post("/logs/purge", tags=[TAG_LOGS])
+def logs_purge(
+    retention_days: Optional[int] = Query(None, description="Dias a retener (default: OCR_LOG_RETENTION_DAYS)"),
+    _: Dict[str, Any] = Depends(require_service_auth),
+) -> Dict[str, Any]:
+    """
+    Purga logs mas antiguos que retention_days.
+    """
+    result = purge_old_logs(retention_days)
+    result["timestamp_utc"] = utc_now_iso()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Integration test: upload file and validate full pipeline without DB
+# ---------------------------------------------------------------------------
+
+@app.post("/validate-pipeline/upload", tags=[TAG_VALIDATION])
+async def validate_pipeline_upload(
+    file: UploadFile = File(..., description="Archivo PDF, DOCX, imagen, etc. para validar el pipeline completo."),
+    chunking_strategy: str = Query("semantic", description="semantic | simple"),
+    embedding_model: str = Query(DEFAULT_EMBEDDING_MODEL, description="Modelo de embeddings a usar"),
+    max_chunks: int = Query(0, ge=0, description="Limite de chunks (0 = sin limite)"),
+    _: Dict[str, Any] = Depends(require_service_auth),
+) -> Dict[str, Any]:
+    """
+    Validacion integral del pipeline sin persistencia en BD.
+    Sube un archivo y ejecuta: deteccion MIME -> OCR/Docling -> limpieza ->
+    chunking -> embeddings GPU. Retorna reporte detallado con tiempos por fase,
+    calidad OCR, preview de texto, chunks y dimensiones de vectores.
+
+    Ideal para validar que la cadena GPU+librerias funciona de punta a punta
+    antes de procesar documentos reales.
+    """
+    started = time.monotonic()
+    recorder = PhaseRecorder()
+    result_data: Dict[str, Any] = {"source": "upload_validation"}
+    log_filename: Optional[str] = None
+
+    try:
+        # --- Phase 1: Read uploaded file ---
+        phase_start = time.monotonic()
+        file_bytes = await file.read()
+        original_filename = safe_str(file.filename, "uploaded_file")
+        file_size = len(file_bytes)
+        if file_size == 0:
+            raise PipelineError("UPLOAD", "EMPTY_FILE", "El archivo subido esta vacio.")
+        file_sha256 = hashlib.sha256(file_bytes).hexdigest()
+
+        mime_type = normalize_mime_type(file.content_type)
+        if not mime_type:
+            mime_type = normalize_mime_type(infer_mime_type_from_file_name(original_filename))
+        if not mime_type:
+            mime_type = "application/pdf"
+
+        recorder.push("UPLOAD", "OK", "Archivo recibido.", {
+            "filename": original_filename,
+            "size_bytes": file_size,
+            "mime_type": mime_type,
+            "sha256": file_sha256,
+            "elapsed_ms": int((time.monotonic() - phase_start) * 1000),
+        })
+
+        # --- Phase 2: MIME validation ---
+        if not is_supported_docling_mime(mime_type):
+            raise PipelineError(
+                "MIME_VALIDATION", "UNSUPPORTED_MIME_TYPE",
+                f"Mime type '{mime_type}' no soportado.",
+                {"supported": sorted(SUPPORTED_DOCLING_MIME_TYPES)},
+            )
+        recorder.push("MIME_VALIDATION", "OK", "Mime type soportado.", {"mime_type": mime_type})
+
+        is_pdf = mime_type == "application/pdf"
+        extraction_opts = ExtractionOptions()
+
+        # --- Phase 3: Probe (PDF only) ---
+        probe: Dict[str, Any] = {}
+        engine = "docling"
+        if is_pdf:
+            phase_start = time.monotonic()
+            probe = probe_pdf_extractability(file_bytes, DEFAULT_PROBE_MAX_PAGES)
+            engine = resolve_extraction_engine(extraction_opts, probe)
+            recorder.push("PROBE", "OK", "Probe completado.", {
+                **probe,
+                "engine_selected": engine,
+                "elapsed_ms": int((time.monotonic() - phase_start) * 1000),
+            })
+        else:
+            recorder.push("PROBE", "SKIPPED", "Probe solo aplica a PDF.")
+
+        # --- Phase 4: Text extraction ---
+        phase_start = time.monotonic()
+        extraction_meta: Dict[str, Any] = {"engine": engine}
+        if is_pdf and engine == "pymupdf":
+            extracted_text, extracted_pages = extract_text_pymupdf(file_bytes)
+            extraction_meta["ocr_quality"] = safe_float(probe.get("extractable_confidence"), None)
+        else:
+            extracted_text, extracted_pages, docling_meta = extract_text_docling(
+                file_bytes, extraction_opts, mime_type=mime_type, file_name=original_filename,
+            )
+            extraction_meta.update(docling_meta)
+
+        if not extracted_text.strip():
+            raise PipelineError("TEXT_EXTRACTION", "EMPTY_TEXT", "No se extrajo texto del archivo.")
+
+        extraction_meta.update({
+            "chars": len(extracted_text),
+            "pages": extracted_pages,
+            "elapsed_ms": int((time.monotonic() - phase_start) * 1000),
+        })
+        recorder.push("TEXT_EXTRACTION", "OK", "Extraccion completada.", extraction_meta)
+
+        # --- Phase 5: Cleaning ---
+        phase_start = time.monotonic()
+        cleaning_opts = CleaningOptions()
+        cleaned_text, cleaning_meta = clean_text(extracted_text, cleaning_opts)
+        text_for_chunking = cleaned_text if cleaning_opts.enabled else extracted_text
+        if not text_for_chunking.strip():
+            raise PipelineError("TEXT_CLEANING", "EMPTY_AFTER_CLEANING", "Texto vacio tras limpieza.")
+        cleaning_meta["elapsed_ms"] = int((time.monotonic() - phase_start) * 1000)
+        recorder.push("TEXT_CLEANING", "OK", "Limpieza completada.", cleaning_meta)
+
+        # --- Phase 6: Chunking ---
+        phase_start = time.monotonic()
+        chunking_opts = ChunkingOptions(strategy=chunking_strategy, max_chunks=max_chunks)
+        if chunking_strategy == "semantic":
+            tokenizer_for_chunk: Optional[Any] = None
+            try:
+                tokenizer_for_chunk = load_tokenizer(embedding_model)
+            except Exception:
+                pass
+            semantic_max_tokens = max(256, derive_embedding_max_length(chunking_opts))
+            try:
+                chunks = semantic_chunk_text(text_for_chunking, tokenizer_for_chunk, embedding_model, semantic_max_tokens)
+            except Exception:
+                chunks = simple_chunk_text(text_for_chunking, chunking_opts.simple_chunk_size, chunking_opts.simple_chunk_overlap)
+                chunking_strategy = "simple_fallback"
+        else:
+            chunks = simple_chunk_text(text_for_chunking, chunking_opts.simple_chunk_size, chunking_opts.simple_chunk_overlap)
+
+        if max_chunks > 0:
+            chunks = chunks[:max_chunks]
+        chunks = [c for c in chunks if c.strip()]
+        if not chunks:
+            raise PipelineError("CHUNKING", "NO_CHUNKS", "No se generaron chunks.")
+
+        chunking_elapsed = int((time.monotonic() - phase_start) * 1000)
+        recorder.push("CHUNKING", "OK", "Chunking completado.", {
+            "strategy": chunking_strategy,
+            "chunks_count": len(chunks),
+            "avg_chunk_chars": round(sum(len(c) for c in chunks) / len(chunks), 1),
+            "elapsed_ms": chunking_elapsed,
+        })
+
+        # --- Phase 7: Embeddings (GPU) ---
+        phase_start = time.monotonic()
+        tokenizer, model, device = load_embedding_model(embedding_model)
+        derived_max_length = derive_embedding_max_length(chunking_opts)
+        vectors, tokens_per_chunk = embed_chunks(
+            chunks=chunks, tokenizer=tokenizer, model=model,
+            device=device, max_length=derived_max_length, batch_size=8,
+        )
+        embedding_elapsed = int((time.monotonic() - phase_start) * 1000)
+        vector_dim = len(vectors[0]) if vectors else 0
+
+        recorder.push("EMBEDDINGS", "OK", "Embeddings generados en GPU.", {
+            "model": embedding_model,
+            "device": device,
+            "vectors_count": len(vectors),
+            "vector_dimension": vector_dim,
+            "total_tokens": sum(tokens_per_chunk),
+            "elapsed_ms": embedding_elapsed,
+        })
+
+        # --- Build result ---
+        total_elapsed = int((time.monotonic() - started) * 1000)
+        result_data.update({
+            "status": "COMPLETED",
+            "filename": original_filename,
+            "file_size_bytes": file_size,
+            "mime_type": mime_type,
+            "sha256": file_sha256,
+            "engine_used": engine,
+            "ocr_quality": safe_float(extraction_meta.get("ocr_quality"), None),
+            "text_chars": len(text_for_chunking),
+            "text_words": count_words(text_for_chunking),
+            "text_preview": text_for_chunking[:1000],
+            "pages": extracted_pages,
+            "chunks_count": len(chunks),
+            "chunks_preview": [c[:200] for c in chunks[:5]],
+            "vectors_count": len(vectors),
+            "vector_dimension": vector_dim,
+            "embedding_model": embedding_model,
+            "gpu_device": device,
+            "gpu_metrics": gpu_metrics(),
+            "total_elapsed_ms": total_elapsed,
+            "timing": {
+                "extraction_ms": extraction_meta.get("elapsed_ms"),
+                "cleaning_ms": cleaning_meta.get("elapsed_ms"),
+                "chunking_ms": chunking_elapsed,
+                "embedding_ms": embedding_elapsed,
+                "total_ms": total_elapsed,
+            },
+            "persisted_to_db": False,
+        })
+
+        log_filename = write_pipeline_log(
+            oid=None, stage="validate_upload", status="COMPLETED",
+            phases=recorder.as_list(), data=result_data, source="validation",
+        )
+
+        return {
+            "timestamp_utc": utc_now_iso(),
+            "status": "ok",
+            "message": "Pipeline integral validado exitosamente.",
+            "log_file": log_filename,
+            "phases": recorder.as_list(),
+            "result": result_data,
+        }
+
+    except PipelineError as exc:
+        recorder.push(exc.phase, "ERROR", exc.message, exc.details)
+        error_data = exc.to_dict()
+        total_elapsed = int((time.monotonic() - started) * 1000)
+        result_data.update({"status": "FAILED", "total_elapsed_ms": total_elapsed})
+        log_filename = write_pipeline_log(
+            oid=None, stage="validate_upload", status="FAILED",
+            phases=recorder.as_list(), data=result_data, error=error_data, source="validation",
+        )
+        raise HTTPException(status_code=422, detail=to_json_safe({
+            "status": "FAILED",
+            "message": exc.message,
+            "error": error_data,
+            "phases": recorder.as_list(),
+            "log_file": log_filename,
+            "total_elapsed_ms": total_elapsed,
+        }))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        recorder.push("UNHANDLED", "ERROR", str(exc), {"traceback": traceback.format_exc()})
+        total_elapsed = int((time.monotonic() - started) * 1000)
+        result_data.update({"status": "FAILED", "total_elapsed_ms": total_elapsed})
+        log_filename = write_pipeline_log(
+            oid=None, stage="validate_upload", status="FAILED",
+            phases=recorder.as_list(), error={"message": str(exc)}, source="validation",
+        )
+        raise HTTPException(status_code=500, detail=to_json_safe({
+            "status": "FAILED",
+            "message": f"{type(exc).__name__}: {str(exc)}",
+            "phases": recorder.as_list(),
+            "log_file": log_filename,
+            "total_elapsed_ms": total_elapsed,
+        }))
 
 
 def _raise_forbidden(detail: Dict[str, Any]) -> None:
