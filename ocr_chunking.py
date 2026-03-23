@@ -238,12 +238,72 @@ MULTI_EMPTY_LINES_PATTERN = re.compile(r"\n{3,}")
 WORD_TOKEN_PATTERN = re.compile(r"[A-Za-zÁÉÍÓÚáéíóúÜüÑñ]+", re.UNICODE)
 
 # ---------------------------------------------------------------------------
-# Large-document processing: chunk PDFs into blocks of N pages to avoid
-# std::bad_alloc in docling-parse and to enable per-block GC.
-# Env OCR_PAGE_CHUNK_SIZE=0 disables chunking (process full doc at once).
+# Procesamiento de documentos grandes: divide PDFs en bloques de N paginas
+# para evitar std::bad_alloc en docling-parse y habilitar GC entre bloques.
+# Env OCR_PAGE_CHUNK_SIZE=0 desactiva el chunking (procesa el doc completo).
 # ---------------------------------------------------------------------------
 PAGE_CHUNK_SIZE = int(os.getenv("OCR_PAGE_CHUNK_SIZE", "50"))
+PAGE_CHUNK_SIZE_HEAVY = int(os.getenv("OCR_PAGE_CHUNK_SIZE_HEAVY", "25"))
 PAGE_CHUNK_DOCUMENT_TIMEOUT = float(os.getenv("OCR_DOCUMENT_TIMEOUT", "300"))
+
+# ---------------------------------------------------------------------------
+# Timeouts adaptativos por tipo MIME (segundos).
+# El consumer usa estos valores para estimar si un batch excede el timeout global.
+# ---------------------------------------------------------------------------
+TIMEOUT_PER_FORMAT = {
+    "application/pdf": 3.0,           # ~3s por pagina (OCR + layout)
+    "application/msword": 15.0,       # Conversion LibreOffice + parsing
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": 10.0,
+    "application/vnd.ms-excel": 20.0,  # Puede ser lento en hojas grandes
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": 15.0,
+    "application/vnd.ms-powerpoint": 15.0,
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": 10.0,
+    "image/jpeg": 5.0,
+    "image/png": 5.0,
+    "image/tiff": 8.0,
+    "image/bmp": 5.0,
+    "text/plain": 2.0,
+    "text/csv": 2.0,
+    "text/html": 3.0,
+    "application/json": 2.0,
+    "application/xml": 3.0,
+}
+TIMEOUT_EMBEDDINGS_BASE = 10.0  # Tiempo base para generacion de embeddings por documento
+
+
+def estimate_document_timeout(mime_type: str, pages: int = 1, size_bytes: int = 0) -> float:
+    """Estima el tiempo de procesamiento (segundos) para un documento.
+
+    El consumer usa esta funcion para decidir la composicion del batch
+    y evitar exceder el timeout global.
+    Formula: base_por_formato * paginas + embeddings_base + penalizacion_tamano
+    """
+    base = TIMEOUT_PER_FORMAT.get(normalize_mime_type(mime_type), 5.0)
+    # PDFs: escala por paginas. Otros: base fija.
+    if "pdf" in (mime_type or "").lower():
+        estimated = base * max(pages, 1) + TIMEOUT_EMBEDDINGS_BASE
+    else:
+        estimated = base + TIMEOUT_EMBEDDINGS_BASE
+    # Penalizacion por tamano: archivos >50MB reciben tiempo extra
+    if size_bytes > 50_000_000:
+        estimated += (size_bytes / 50_000_000) * 30.0
+    return estimated
+
+
+def estimate_batch_timeout(items: List[Dict[str, Any]]) -> float:
+    """Estima el tiempo total para un batch de documentos.
+
+    Cada item debe tener: mime_type, pages (opcional), size_bytes (opcional).
+    Retorna el total estimado en segundos con 20% de margen de seguridad.
+    """
+    total = 0.0
+    for item in items:
+        total += estimate_document_timeout(
+            item.get("mime_type", "application/pdf"),
+            item.get("pages", 1),
+            item.get("size_bytes", 0),
+        )
+    return total * 1.2  # 20% margen de seguridad
 
 # Configure docling global performance settings for GPU throughput.
 # page_batch_size controls how many pages are sent to GPU models at once.
@@ -2048,6 +2108,42 @@ def extract_docling_confidence_bundle(result: Any) -> Dict[str, Any]:
     }
 
 
+def _estimate_pdf_weight(pdf_bytes: bytes, sample_pages: int = 5) -> str:
+    """Estima si un PDF es 'heavy' (rico en imagenes) o 'light' (rico en texto).
+
+    Muestrea las primeras N paginas. Si >60% tienen imagenes o el promedio
+    de bytes/pagina > 100KB, retorna 'heavy'. Caso contrario 'light'.
+    Se usa para elegir el tamano de chunk: heavy=25 paginas, light=50 paginas.
+    """
+    try:
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+            total = doc.page_count
+            sample = min(sample_pages, total)
+            pages_with_images = 0
+            total_bytes = len(pdf_bytes)
+            avg_bytes_per_page = total_bytes / max(total, 1)
+
+            for i in range(sample):
+                page = doc[i]
+                if page.get_images():
+                    pages_with_images += 1
+
+            image_ratio = pages_with_images / max(sample, 1)
+            if image_ratio > 0.6 or avg_bytes_per_page > 100_000:
+                return "heavy"
+            return "light"
+    except Exception:
+        return "heavy"  # Default to safe chunk size
+
+
+def _adaptive_chunk_size(pdf_bytes: bytes) -> int:
+    """Retorna el tamano optimo de chunk segun el peso del contenido del PDF."""
+    weight = _estimate_pdf_weight(pdf_bytes)
+    if weight == "heavy":
+        return PAGE_CHUNK_SIZE_HEAVY
+    return PAGE_CHUNK_SIZE
+
+
 def _split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[bytes, int, int]]:
     """Splits a PDF into page-range chunks using PyMuPDF.
 
@@ -2265,12 +2361,13 @@ def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mim
         with fitz.open(stream=binary_bytes, filetype="pdf") as doc:
             total_pages = doc.page_count
 
-        if total_pages > PAGE_CHUNK_SIZE:
+        adaptive_size = _adaptive_chunk_size(binary_bytes)
+        if total_pages > adaptive_size:
             LOGGER.info(
-                "Large PDF detected (%d pages). Splitting into chunks of %d pages.",
-                total_pages, PAGE_CHUNK_SIZE,
+                "Large PDF detected (%d pages, weight=%s). Splitting into chunks of %d pages.",
+                total_pages, _estimate_pdf_weight(binary_bytes), adaptive_size,
             )
-            chunks = _split_pdf_into_chunks(binary_bytes, PAGE_CHUNK_SIZE)
+            chunks = _split_pdf_into_chunks(binary_bytes, adaptive_size)
             all_texts: List[str] = []
             total_extracted_pages = 0
             last_meta: Dict[str, Any] = {}
@@ -2308,7 +2405,8 @@ def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mim
                 "mime_type": normalized_mime,
                 "total_pages_original": total_pages,
                 "chunks_processed": len(chunks),
-                "chunk_size": PAGE_CHUNK_SIZE,
+                "chunk_size": adaptive_size,
+                "pdf_weight": _estimate_pdf_weight(binary_bytes),
             })
             return combined_text, total_extracted_pages, last_meta
 
@@ -3858,6 +3956,15 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
         )
 
     finally:
+        # Liberar memoria GPU/CPU despues de cada ejecucion del pipeline
+        try:
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
         if request.queue.enabled and queue_slot_acquired:
             try:
                 with PostgresClient(PostgresSettings.from_env()) as db_final:
