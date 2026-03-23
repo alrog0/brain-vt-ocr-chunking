@@ -1450,6 +1450,49 @@ class PostgresClient:
         params.append(int(job_id))
         self.execute(sql, tuple(params))
 
+    def log_to_operaciones(
+        self,
+        nivel: str,
+        modulo: str,
+        mensaje: str,
+        contexto: Optional[str] = None,
+        stack_trace: Optional[str] = None,
+        also_error: bool = False,
+        error_tipo: Optional[str] = None,
+    ) -> None:
+        """Registra en Operaciones.LogsSistema y opcionalmente en Operaciones.Errores.
+
+        Args:
+            nivel: INFO, WARNING, ERROR, CRITICAL (se castea a Operaciones.NivelLog)
+            modulo: nombre del modulo (ej. 'ocr_chunking')
+            mensaje: descripcion del evento
+            contexto: JSON string con detalles adicionales
+            stack_trace: traceback si aplica
+            also_error: si True, tambien inserta en Operaciones.Errores
+            error_tipo: tipo de error para Operaciones.Errores (ej. 'PIPELINE_ERROR')
+        """
+        try:
+            self.execute(
+                'INSERT INTO "Operaciones"."LogsSistema" '
+                '("timestamp","nivel","modulo","mensaje","contexto","stackTrace") '
+                'VALUES ("BrainVtCommons"."getBogotaTime"(),'
+                'CAST(%s AS "Operaciones"."NivelLog"),%s,%s,%s,%s)',
+                (nivel, modulo, mensaje[:2000], contexto, stack_trace),
+            )
+        except Exception:
+            LOGGER.debug("log_to_operaciones: LogsSistema insert failed", exc_info=True)
+
+        if also_error and nivel in ("ERROR", "CRITICAL"):
+            try:
+                self.execute(
+                    'INSERT INTO "Operaciones"."Errores" '
+                    '("timestamp","tipo","modulo","mensaje","contexto","stackTrace","resuelto") '
+                    'VALUES ("BrainVtCommons"."getBogotaTime"(),%s,%s,%s,%s,%s,false)',
+                    (error_tipo or "PIPELINE_ERROR", modulo, mensaje[:2000], contexto, stack_trace),
+                )
+            except Exception:
+                LOGGER.debug("log_to_operaciones: Errores insert failed", exc_info=True)
+
     def get_job(self, job_id: int) -> Optional[Dict[str, Any]]:
         """Gets one job row."""
         sql = """
@@ -3695,6 +3738,16 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 set_fin=True,
             )
 
+            try:
+                with PostgresClient(PostgresSettings.from_env()) as db_log:
+                    db_log.log_to_operaciones(
+                        nivel="INFO", modulo="ocr_chunking",
+                        mensaje=f"Pipeline completado: oid={int(request.oid)} doc={file_name}"[:2000],
+                        contexto=json.dumps({"oid": int(request.oid), "job_id": job_id, "file_name": file_name, "stage": stage_key}, ensure_ascii=False),
+                    )
+            except Exception:
+                LOGGER.debug("No fue posible registrar exito en Operaciones.", exc_info=True)
+
             return OCRChunkingResponse(
                 status="COMPLETED",
                 exitoso=True,
@@ -3706,6 +3759,17 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     except PipelineError as exc:
         LOGGER.error("PipelineError phase=%s code=%s message=%s", exc.phase, exc.code, exc.message)
         trace_text = traceback.format_exc()
+        try:
+            with PostgresClient(PostgresSettings.from_env()) as db_log:
+                db_log.log_to_operaciones(
+                    nivel="ERROR", modulo="ocr_chunking",
+                    mensaje=f"[{exc.phase}] {exc.code}: {exc.message}"[:2000],
+                    contexto=json.dumps({"phase": exc.phase, "code": exc.code, "oid": int(request.oid), "job_id": job_id, "file_name": file_name, "retryable": exc.retryable}, ensure_ascii=False),
+                    stack_trace=trace_text[:4000],
+                    also_error=True, error_tipo=exc.code,
+                )
+        except Exception:
+            LOGGER.debug("No fue posible registrar PipelineError en Operaciones.", exc_info=True)
         error_details = dict(exc.details or {})
         if not error_details.get("traceback"):
             error_details["traceback"] = trace_text
@@ -3747,6 +3811,17 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
 
     except Exception as exc:
         LOGGER.exception("Error inesperado en pipeline.")
+        try:
+            with PostgresClient(PostgresSettings.from_env()) as db_log:
+                db_log.log_to_operaciones(
+                    nivel="CRITICAL", modulo="ocr_chunking",
+                    mensaje=f"UNHANDLED: {type(exc).__name__}: {str(exc)}"[:2000],
+                    contexto=json.dumps({"oid": int(request.oid), "job_id": job_id, "file_name": file_name}, ensure_ascii=False),
+                    stack_trace=traceback.format_exc()[:4000],
+                    also_error=True, error_tipo="UNEXPECTED_ERROR",
+                )
+        except Exception:
+            LOGGER.debug("No fue posible registrar error inesperado en Operaciones.", exc_info=True)
         unknown = PipelineError(
             "UNHANDLED_EXCEPTION",
             "UNEXPECTED_ERROR",
@@ -3950,7 +4025,8 @@ def health_dependencies(_: Dict[str, Any] = Depends(require_service_auth)) -> Di
             )
             lo_version = proc.stdout.strip() or proc.stderr.strip() or "desconocida"
         except Exception as exc:
-            lo_version = f"error: {exc}"
+            LOGGER.error("LibreOffice version check failed: %s", exc)
+            lo_version = "error: no se pudo obtener la version"
 
     # --- PostgreSQL ---
     pg_ok = False
@@ -3960,7 +4036,8 @@ def health_dependencies(_: Dict[str, Any] = Depends(require_service_auth)) -> Di
             db.execute_returning_one("SELECT 1", ())
             pg_ok = True
     except Exception as exc:
-        pg_error = str(exc)[:200]
+        LOGGER.error("PostgreSQL health check failed: %s", exc)
+        pg_error = "Database connection failed"
 
     # --- GPU / CUDA ---
     gpu_info = gpu_metrics()
@@ -3991,7 +4068,6 @@ def health_dependencies(_: Dict[str, Any] = Depends(require_service_auth)) -> Di
     deps = {
         "libreoffice": {
             "instalado": lo_cmd is not None,
-            "ruta": lo_cmd,
             "version": lo_version,
             "formatos_legacy_soportados": [".doc", ".xls", ".ppt"] if lo_cmd else [],
             "nota": None if lo_cmd else "Archivos .doc/.xls/.ppt seran etiquetados como 'Formato no soportado'",
