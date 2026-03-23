@@ -63,7 +63,7 @@ from transformers import AutoModel, AutoTokenizer
 
 
 SERVICE_NAME = "OCR Chunking Embeddings Orchestrator"
-SERVICE_VERSION = "2.0.0"
+SERVICE_VERSION = "3.0.0-20260323"
 TAG_CHUNKING = "Segmento Chunking"
 TAG_EMBEDDING = "Segmento Embedding"
 TAG_OCR = "Segmento Docling-OCR"
