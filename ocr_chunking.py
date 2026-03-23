@@ -111,6 +111,10 @@ SUPPORTED_DOCLING_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    # Legacy Office (OLE2) — se convierten a OOXML con LibreOffice en runtime
+    "application/msword",
+    "application/vnd.ms-excel",
+    "application/vnd.ms-powerpoint",
     # Markup / text
     "text/markdown",
     "text/x-markdown",
@@ -177,8 +181,11 @@ MIME_TO_EXTENSION = {
 EXTENSION_TO_MIME = {
     ".pdf": "application/pdf",
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",  # legacy OLE2 → se convierte a docx en runtime
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",  # legacy OLE2 → se convierte a xlsx en runtime
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".ppt": "application/vnd.ms-powerpoint",  # legacy OLE2 → se convierte a pptx en runtime
     ".md": "text/markdown",
     ".markdown": "text/markdown",
     ".adoc": "text/asciidoc",
@@ -189,6 +196,7 @@ EXTENSION_TO_MIME = {
     ".htm": "text/html",
     ".xhtml": "application/xhtml+xml",
     ".csv": "text/csv",
+    ".txt": "text/plain",
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -205,7 +213,21 @@ EXTENSION_TO_MIME = {
     ".vtt": "text/vtt",
     ".xml": "application/xml",
     ".json": "application/json",
+    ".rtf": "text/html",  # RTF → treat as HTML for extraction
 }
+# Magic bytes for binary MIME detection fallback
+_MAGIC_SIGNATURES = [
+    (b"%PDF", "application/pdf"),
+    (b"PK\x03\x04", "application/zip"),  # ZIP-based: docx, xlsx, pptx
+    (b"\xd0\xcf\x11\xe0", "application/msword"),  # OLE2: legacy doc/xls/ppt
+    (b"\x89PNG", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF8", "image/gif"),
+    (b"BM", "image/bmp"),
+    (b"RIFF", "audio/wav"),
+    (b"II\x2a\x00", "image/tiff"),
+    (b"MM\x00\x2a", "image/tiff"),
+]
 
 PAGE_INDICATOR_PATTERN = re.compile(
     r"(?i)^\s*(?:pagina\s+\d+\s+de\s+\d+|page\s+\d+|\-\s*\d+\s*\-|\[\d+\])\s*$",
@@ -408,13 +430,51 @@ def infer_mime_type_from_file_name(file_name: str) -> str:
     return EXTENSION_TO_MIME.get(ext.lower(), "")
 
 
+def infer_mime_from_binary(data: bytes) -> str:
+    """Detecta MIME type por magic bytes del contenido binario."""
+    if not data or len(data) < 4:
+        return ""
+    header = data[:8]
+    for signature, mime in _MAGIC_SIGNATURES:
+        if header[:len(signature)] == signature:
+            return mime
+    return ""
+
+
+def resolve_zip_based_mime(data: bytes, file_name: str) -> str:
+    """Para archivos ZIP (docx/xlsx/pptx), resuelve el tipo real por extensión o contenido."""
+    ext = os.path.splitext(normalize_file_name(file_name))[1].lower() if file_name else ""
+    if ext in (".docx", ".doc"):
+        return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    if ext in (".xlsx", ".xls"):
+        return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    if ext in (".pptx", ".ppt"):
+        return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    # Intentar detectar por contenido del ZIP
+    try:
+        import zipfile
+        import io
+        with zipfile.ZipFile(io.BytesIO(data[:65536])) as zf:
+            names = set(zf.namelist())
+            if "word/document.xml" in names:
+                return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            if "xl/workbook.xml" in names:
+                return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if "ppt/presentation.xml" in names:
+                return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    except Exception:
+        pass
+    return "application/zip"
+
+
 def resolve_request_mime_type(
     request_mime_type: Optional[str],
     request_metadata: Dict[str, Any],
     documento_info: Optional[Dict[str, Any]],
     file_name: str,
+    binary_data: Optional[bytes] = None,
 ) -> str:
-    """Resuelve mime type desde request, metadata, documento y extension."""
+    """Resuelve mime type desde request, metadata, documento, extension y contenido binario."""
     candidate = normalize_mime_type(request_mime_type)
     if candidate:
         return candidate
@@ -427,7 +487,21 @@ def resolve_request_mime_type(
     candidate = normalize_mime_type((documento_info or {}).get("archivo_mime_type"))
     if candidate:
         return candidate
-    return normalize_mime_type(infer_mime_type_from_file_name(file_name))
+    candidate = normalize_mime_type(infer_mime_type_from_file_name(file_name))
+    if candidate:
+        return candidate
+    # Fallback: detección por contenido binario
+    if binary_data:
+        magic_mime = infer_mime_from_binary(binary_data)
+        if magic_mime == "application/zip":
+            return resolve_zip_based_mime(binary_data, file_name)
+        if magic_mime == "application/msword":
+            # Legacy OLE2 — map by extension or default to docx
+            ext = os.path.splitext(normalize_file_name(file_name))[1].lower() if file_name else ""
+            return EXTENSION_TO_MIME.get(ext, "application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        if magic_mime:
+            return magic_mime
+    return ""
 
 
 def is_supported_docling_mime(mime_type: str) -> bool:
@@ -631,12 +705,15 @@ def mean_pooling(model_output: Any, attention_mask: Any) -> Any:
 class PipelineError(Exception):
     """Pipeline exception with phase and machine-friendly error code."""
 
-    def __init__(self, phase: str, code: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, phase: str, code: str, message: str,
+                 details: Optional[Dict[str, Any]] = None,
+                 retryable: bool = True) -> None:
         super().__init__(message)
         self.phase = phase
         self.code = code
         self.message = message
         self.details = details or {}
+        self.retryable = retryable
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize error."""
@@ -645,6 +722,7 @@ class PipelineError(Exception):
             "code": self.code,
             "message": self.message,
             "details": self.details,
+            "retryable": self.retryable,
         }
 
 
@@ -785,66 +863,152 @@ class PostgresClient:
 
     def __init__(self, settings: PostgresSettings) -> None:
         self.settings = settings
+        self._connect()
+
+    def _connect(self) -> None:
         self.conn = psycopg2.connect(
-            host=settings.host,
-            port=settings.port,
-            dbname=settings.dbname,
-            user=settings.user,
-            password=settings.password,
+            host=self.settings.host,
+            port=self.settings.port,
+            dbname=self.settings.dbname,
+            user=self.settings.user,
+            password=self.settings.password,
         )
         self.conn.autocommit = False
+
+    def _is_alive(self) -> bool:
+        try:
+            if self.conn.closed:
+                return False
+            with self.conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    def _ensure_connection(self) -> None:
+        if not self._is_alive():
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self._connect()
+
+    def _reconnect(self) -> None:
+        """Force reconnect after connection loss."""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        import time
+        for attempt in range(3):
+            try:
+                self._connect()
+                LOGGER.info("PostgresClient reconnected (attempt %d)", attempt + 1)
+                return
+            except Exception as exc:
+                if attempt < 2:
+                    wait = (attempt + 1) * 2
+                    LOGGER.warning(
+                        "Reconnect attempt %d failed: %s. Retrying in %ds...",
+                        attempt + 1, str(exc)[:200], wait,
+                    )
+                    time.sleep(wait)
+                else:
+                    LOGGER.error("Reconnect failed after 3 attempts: %s", str(exc)[:200])
+                    raise
+
+    def _is_connection_error(self, exc: Exception) -> bool:
+        """Check if exception is a connection-level error (recoverable by reconnect)."""
+        return isinstance(exc, (
+            psycopg2.OperationalError,
+            psycopg2.InterfaceError,
+        ))
+
+    def _safe_rollback(self) -> None:
+        try:
+            if self.conn and not self.conn.closed:
+                self.conn.rollback()
+        except Exception:
+            pass
 
     def __enter__(self) -> "PostgresClient":
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
         if exc is not None:
-            try:
-                self.conn.rollback()
-            except Exception:
-                pass
+            self._safe_rollback()
         try:
             self.conn.close()
         except Exception:
             pass
 
     def query_one(self, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-        """Executes SELECT and returns one dict row."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            row = cur.fetchone()
-        return dict(row) if row is not None else None
+        """Executes SELECT and returns one dict row. Retries once on connection error."""
+        for attempt in range(2):
+            self._ensure_connection()
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                return dict(row) if row is not None else None
+            except Exception as exc:
+                if attempt == 0 and self._is_connection_error(exc):
+                    LOGGER.warning("query_one connection lost, reconnecting...")
+                    self._reconnect()
+                    continue
+                raise
 
     def query_all(self, sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
-        """Executes SELECT and returns all dict rows."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
-        return [dict(r) for r in rows]
+        """Executes SELECT and returns all dict rows. Retries once on connection error."""
+        for attempt in range(2):
+            self._ensure_connection()
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    rows = cur.fetchall()
+                return [dict(r) for r in rows]
+            except Exception as exc:
+                if attempt == 0 and self._is_connection_error(exc):
+                    LOGGER.warning("query_all connection lost, reconnecting...")
+                    self._reconnect()
+                    continue
+                raise
 
     def execute(self, sql: str, params: Tuple[Any, ...] = ()) -> int:
-        """Executes write SQL and returns affected rows."""
-        try:
-            with self.conn.cursor() as cur:
-                cur.execute(sql, params)
-                affected = int(cur.rowcount)
-            self.conn.commit()
-            return affected
-        except Exception:
-            self.conn.rollback()
-            raise
+        """Executes write SQL and returns affected rows. Retries once on connection error."""
+        for attempt in range(2):
+            self._ensure_connection()
+            try:
+                with self.conn.cursor() as cur:
+                    cur.execute(sql, params)
+                    affected = int(cur.rowcount)
+                self.conn.commit()
+                return affected
+            except Exception as exc:
+                self._safe_rollback()
+                if attempt == 0 and self._is_connection_error(exc):
+                    LOGGER.warning("execute connection lost, reconnecting...")
+                    self._reconnect()
+                    continue
+                raise
 
     def execute_returning_one(self, sql: str, params: Tuple[Any, ...] = ()) -> Optional[Dict[str, Any]]:
-        """Executes write SQL with RETURNING and returns one row."""
-        try:
-            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute(sql, params)
-                row = cur.fetchone()
-            self.conn.commit()
-            return dict(row) if row is not None else None
-        except Exception:
-            self.conn.rollback()
-            raise
+        """Executes write SQL with RETURNING and returns one row. Retries once on connection error."""
+        for attempt in range(2):
+            self._ensure_connection()
+            try:
+                with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    row = cur.fetchone()
+                self.conn.commit()
+                return dict(row) if row is not None else None
+            except Exception as exc:
+                self._safe_rollback()
+                if attempt == 0 and self._is_connection_error(exc):
+                    LOGGER.warning("execute_returning_one connection lost, reconnecting...")
+                    self._reconnect()
+                    continue
+                raise
 
     def fetch_item_by_oid(self, oid: int) -> Optional[Dict[str, Any]]:
         """Gets latest item from Operaciones.ItemsIngestaSmb by loOid."""
@@ -963,6 +1127,7 @@ class PostgresClient:
           "contenidoTexto" = %s,
           "contenidoHash" = %s,
           "ocrAplicado" = true,
+          "faseActual" = CASE WHEN "faseActual" IN ('INGESTA', 'OCR') THEN 'OCR' ELSE "faseActual" END,
           "calidadOcr" = COALESCE(%s, "calidadOcr"),
           "paginas" = COALESCE(%s, "paginas"),
           "palabras" = %s,
@@ -999,15 +1164,16 @@ class PostgresClient:
         documento_id: int,
         metadata_patch: Dict[str, Any],
         updated_by: Optional[int],
-        estado: str = "PROCESADO",
+        estado: str = "EN_PROCESAMIENTO",
     ) -> Optional[Dict[str, Any]]:
-        """Marca finalización de embeddings/chunking y actualiza metadatosExtra."""
+        """Actualiza metadatosExtra tras embeddings/chunking.
+
+        NO modifica embeddingGenerado ni estado — eso lo hace el consumer
+        (consume_jobs_brainvt_gd) que tiene la vision completa del pipeline.
+        """
         sql = """
         UPDATE "GestorDocumental"."Documentos"
         SET
-          "embeddingGenerado" = true,
-          "procesado" = true,
-          "estado" = %s,
           "metadatosExtra" = COALESCE("metadatosExtra"::jsonb, '{}'::jsonb) || %s::jsonb,
           "updatedAt" = (CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'),
           "updatedBy" = COALESCE(%s, "updatedBy")
@@ -1017,13 +1183,11 @@ class PostgresClient:
           "archivoNombre" AS archivo_nombre,
           "estado" AS estado_documento,
           "embeddingGenerado" AS embedding_generado,
-          "procesado" AS procesado,
           "updatedAt" AS updated_at
         """
         return self.execute_returning_one(
             sql,
             (
-                safe_str(estado, "PROCESADO"),
                 json_dumps_safe(metadata_patch),
                 safe_int(updated_by, None),
                 int(documento_id),
@@ -1858,6 +2022,126 @@ def _split_pdf_into_chunks(pdf_bytes: bytes, chunk_size: int) -> List[Tuple[byte
     return chunks
 
 
+def _is_ole2_binary(data: bytes) -> bool:
+    """Detecta si el binario es formato OLE2 (legacy .doc/.xls/.ppt)."""
+    return len(data) >= 4 and data[:4] == b"\xd0\xcf\x11\xe0"
+
+
+def _convert_legacy_office(binary_bytes: bytes, source_ext: str, target_format: str) -> Tuple[bytes, str]:
+    """Convierte archivo legacy Office (OLE2) a formato Open XML usando LibreOffice.
+
+    Args:
+        binary_bytes: contenido binario del archivo legacy
+        source_ext: extensión original (.doc, .xls, .ppt)
+        target_format: formato destino para LibreOffice (docx, xlsx, pptx)
+
+    Returns:
+        (bytes convertidos, extensión resultante)
+    """
+    import subprocess
+    import shutil
+
+    libreoffice_cmd = shutil.which("libreoffice") or shutil.which("soffice")
+    if not libreoffice_cmd:
+        # Buscar en rutas estandar de instalacion (Windows y Linux)
+        for candidate in [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "/usr/bin/libreoffice",
+            "/usr/bin/soffice",
+            "/usr/local/bin/libreoffice",
+            "/usr/local/bin/soffice",
+            "/snap/bin/libreoffice",
+        ]:
+            if os.path.isfile(candidate):
+                libreoffice_cmd = candidate
+                break
+    if not libreoffice_cmd:
+        raise PipelineError(
+            "LEGACY_CONVERSION", "LIBREOFFICE_NOT_FOUND",
+            "LibreOffice no está instalado. Se requiere para convertir archivos "
+            f"legacy ({source_ext}). Instale LibreOffice o convierta el archivo "
+            f"a {target_format} manualmente.",
+            {"source_ext": source_ext, "target_format": target_format},
+            retryable=False,
+        )
+
+    tmpdir = tempfile.mkdtemp(prefix="lo_convert_")
+    src_path = os.path.join(tmpdir, f"input{source_ext}")
+    try:
+        with open(src_path, "wb") as f:
+            f.write(binary_bytes)
+
+        cmd = [
+            libreoffice_cmd, "--headless", "--norestore",
+            "--convert-to", target_format,
+            "--outdir", tmpdir,
+            src_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=120, text=True)
+        if proc.returncode != 0:
+            raise PipelineError(
+                "LEGACY_CONVERSION", "LIBREOFFICE_FAILED",
+                f"LibreOffice falló al convertir {source_ext} → {target_format}.",
+                {"returncode": proc.returncode, "stderr": proc.stderr[:500]},
+            )
+
+        target_ext = f".{target_format}"
+        converted_path = os.path.join(tmpdir, f"input{target_ext}")
+        if not os.path.exists(converted_path):
+            # Buscar cualquier archivo convertido
+            for fname in os.listdir(tmpdir):
+                if fname.endswith(target_ext):
+                    converted_path = os.path.join(tmpdir, fname)
+                    break
+
+        if not os.path.exists(converted_path):
+            raise PipelineError(
+                "LEGACY_CONVERSION", "OUTPUT_NOT_FOUND",
+                f"LibreOffice no generó el archivo convertido.",
+                {"tmpdir_contents": os.listdir(tmpdir)},
+            )
+
+        with open(converted_path, "rb") as f:
+            converted_bytes = f.read()
+
+        LOGGER.info(
+            "Legacy conversion: %s → %s (%d → %d bytes)",
+            source_ext, target_format, len(binary_bytes), len(converted_bytes),
+        )
+        return converted_bytes, target_ext
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _maybe_convert_legacy_office(binary_bytes: bytes, file_name: str, mime_type: str) -> Tuple[bytes, str, str]:
+    """Si el binario es OLE2 (legacy Office), lo convierte a OOXML.
+
+    Returns:
+        (bytes_a_usar, suffix_a_usar, mime_final)
+    """
+    if not _is_ole2_binary(binary_bytes):
+        return binary_bytes, MIME_TO_EXTENSION.get(mime_type, ".bin"), mime_type
+
+    ext = os.path.splitext(normalize_file_name(file_name))[1].lower() if file_name else ""
+    conversion_map = {
+        ".doc": ("docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        ".xls": ("xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        ".ppt": ("pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+    }
+
+    if ext not in conversion_map:
+        # OLE2 sin extensión conocida → intentar como docx
+        ext = ".doc"
+
+    target_format, target_mime = conversion_map[ext]
+    LOGGER.info("Detectado formato legacy OLE2 (%s). Convirtiendo a %s...", ext, target_format)
+
+    converted_bytes, target_ext = _convert_legacy_office(binary_bytes, ext, target_format)
+    return converted_bytes, target_ext, target_mime
+
+
 def _convert_single_block(converter: Any, block_bytes: bytes, suffix: str) -> Tuple[str, int, Dict[str, Any]]:
     """Runs docling converter on a single PDF block and returns (text, pages, meta)."""
     temp = tempfile.NamedTemporaryFile(prefix="docling_blk_", suffix=suffix, delete=False)
@@ -1909,8 +2193,15 @@ def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mim
     For large PDFs (> PAGE_CHUNK_SIZE pages), the document is split into
     page-range blocks processed independently. This prevents std::bad_alloc
     in docling-parse and allows garbage collection between blocks.
+
+    For legacy Office formats (OLE2: .doc/.xls/.ppt), converts to OOXML
+    using LibreOffice before passing to Docling.
     """
-    normalized_mime = normalize_mime_type(mime_type)
+    # Convertir formatos legacy OLE2 si es necesario
+    binary_bytes, converted_suffix, converted_mime = _maybe_convert_legacy_office(
+        binary_bytes, file_name, mime_type,
+    )
+    normalized_mime = normalize_mime_type(converted_mime)
     is_pdf = normalized_mime == "application/pdf"
     if is_pdf:
         converter = load_docling_converter(
@@ -1921,7 +2212,7 @@ def extract_text_docling(binary_bytes: bytes, extraction: ExtractionOptions, mim
     else:
         converter = load_docling_converter_generic()
 
-    suffix = MIME_TO_EXTENSION.get(normalized_mime)
+    suffix = converted_suffix if converted_suffix else MIME_TO_EXTENSION.get(normalized_mime)
     if not suffix:
         _, ext = os.path.splitext(normalize_file_name(file_name))
         suffix = ext if ext else ".bin"
@@ -2477,7 +2768,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
         parametros: Dict[str, Any],
         max_intentos: int,
     ) -> int:
-        """Crea job y traduce errores FK a PipelineError legible."""
+        """Crea job; si FK falla (caller transaction no commiteada), reintenta con documentoId=NULL."""
         try:
             return db.create_job(
                 job_type=job_type,
@@ -2487,24 +2778,38 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 parametros=parametros,
                 max_intentos=max_intentos,
             )
-        except psycopg2.errors.ForeignKeyViolation as exc:
-            raise PipelineError(
+        except psycopg2.errors.ForeignKeyViolation:
+            LOGGER.warning(
+                "JOB_CREATE FK fallback: documentoId=%s no visible (posible tx no commiteada del caller). "
+                "Creando job con documentoId=NULL; documento_id_real queda en parametros.",
+                documento_id,
+            )
+            db.conn.rollback()
+            parametros_with_doc = dict(parametros)
+            parametros_with_doc["documento_id_real"] = documento_id
+            parametros_with_doc["documento_id_fk_fallback"] = True
+            recorder.push(
                 "JOB_CREATE",
-                "INVALID_DOCUMENTO_REFERENCE",
+                "WARN",
                 (
-                    "documentoId no existe en GestorDocumental.Documentos. "
-                    "El OID no se debe usar directamente como documentoId."
+                    f"FK fallback: documentoId={documento_id} no visible en GestorDocumental.Documentos "
+                    "(posible transacción del caller no commiteada). "
+                    "Job creado con documentoId=NULL; documento_id_real preservado en parametros."
                 ),
                 {
                     "oid": int(request.oid),
-                    "documento_id_resuelto": documento_id,
-                    "hint": (
-                        "Verifique metadatosExtra.ocr.metadata.oid o la coincidencia por archivoNombre "
-                        "para resolver un documentoId valido."
-                    ),
-                    "db_error": str(exc),
+                    "documento_id_intended": documento_id,
+                    "fallback": True,
                 },
-            ) from exc
+            )
+            return db.create_job(
+                job_type=job_type,
+                estado=estado,
+                prioridad=prioridad,
+                documento_id=None,
+                parametros=parametros_with_doc,
+                max_intentos=max_intentos,
+            )
 
     try:
         with PostgresClient(PostgresSettings.from_env()) as db:
@@ -2627,18 +2932,24 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         },
                     )
 
+            # Resolución MIME en dos pasos: primero por nombre/metadata,
+            # luego por contenido binario si no se resuelve o no está soportado.
             mime_type = resolve_request_mime_type(
                 request_mime_type=request.mime_type,
                 request_metadata=request.metadata,
                 documento_info=documento_info,
                 file_name=file_name,
             )
+            # Flag para re-validar después de cargar binario si MIME no se resolvió
+            _mime_needs_binary_fallback = not mime_type or not is_supported_docling_mime(mime_type)
             mime_support_info = {
                 "mime_type": mime_type,
                 "supported": is_supported_docling_mime(mime_type),
                 "supported_list": sorted(SUPPORTED_DOCLING_MIME_TYPES),
+                "file_name": file_name,
+                "detection_method": "name_metadata" if mime_type else "pending_binary",
             }
-            if not mime_support_info["supported"]:
+            if not mime_support_info["supported"] and not _mime_needs_binary_fallback:
                 if documento_id is not None:
                     updated_by_guard = (
                         request.created_by
@@ -2649,14 +2960,15 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         documento_id=documento_id,
                         updated_by=updated_by_guard,
                         error_code="UNSUPPORTED_MIME_TYPE",
-                        error_message=f"Mime type no soportado: {mime_type}",
+                        error_message=f"Mime type no soportado: {mime_type}. Archivo: {file_name}",
                         mime_type=mime_type,
                     )
                 raise PipelineError(
                     "MIME_VALIDATION",
                     "UNSUPPORTED_MIME_TYPE",
-                    "Mime type no soportado para procesamiento OCR/Docling.",
+                    f"Mime type '{mime_type}' no soportado para procesamiento OCR/Docling. Archivo: {file_name}",
                     mime_support_info,
+                    retryable=False,
                 )
             recorder.push("MIME_VALIDATION", "OK", "Mime type validado.", mime_support_info)
 
@@ -2756,6 +3068,34 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             if not document_bytes:
                 raise PipelineError("LOAD_BINARY", "EMPTY_BINARY", "Large object vacio.")
             binary_sha256 = hashlib.sha256(document_bytes).hexdigest()
+
+            # Re-validar MIME con contenido binario si la detección por nombre falló
+            if _mime_needs_binary_fallback:
+                mime_type = resolve_request_mime_type(
+                    request_mime_type=request.mime_type,
+                    request_metadata=request.metadata,
+                    documento_info=documento_info,
+                    file_name=file_name,
+                    binary_data=document_bytes,
+                )
+                mime_support_info = {
+                    "mime_type": mime_type,
+                    "supported": is_supported_docling_mime(mime_type),
+                    "file_name": file_name,
+                    "detection_method": "binary_fallback",
+                }
+                if not is_supported_docling_mime(mime_type):
+                    raise PipelineError(
+                        "MIME_VALIDATION",
+                        "UNSUPPORTED_MIME_TYPE",
+                        f"Mime type '{mime_type or 'desconocido'}' no soportado. "
+                        f"Archivo: {file_name}. "
+                        f"Formatos soportados: PDF, DOCX, XLSX, PPTX, HTML, Markdown, CSV, imágenes.",
+                        mime_support_info,
+                        retryable=False,
+                    )
+                LOGGER.info("MIME resuelto por contenido binario: %s (archivo: %s)", mime_type, file_name)
+                recorder.push("MIME_VALIDATION", "OK", f"Mime resuelto por contenido: {mime_type}", mime_support_info)
 
             # Control de hash duplicado en documentos PROCESADOS.
             if not request.overwrite.allow_duplicate_hash:
@@ -2946,6 +3286,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             chunks: List[str] = []
             bounds: List[Tuple[int, int]] = []
             chunking_method = "none"
+            chunk_summary: Optional[Dict[str, Any]] = None
             if run_chunking_stage:
                 chunk_strategy = safe_str(request.chunking.strategy, "semantic").strip().lower()
                 if chunk_strategy not in {"semantic", "simple"}:
@@ -3027,11 +3368,33 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         },
                     )
                 bounds = estimate_bounds(text_for_chunking, chunks)
+                chunk_lengths = [len(c) for c in chunks]
+                short_threshold = 50
+                empty_chunks = sum(1 for c in chunks if not c.strip())
+                short_chunks = sum(1 for ln in chunk_lengths if 0 < ln < short_threshold)
+                chunk_summary = {
+                    "strategy": chunking_method,
+                    "chunks_count": len(chunks),
+                    "chars_total": sum(chunk_lengths),
+                    "chars_min": min(chunk_lengths) if chunk_lengths else 0,
+                    "chars_max": max(chunk_lengths) if chunk_lengths else 0,
+                    "chars_avg": round(sum(chunk_lengths) / len(chunk_lengths), 1) if chunk_lengths else 0,
+                    "empty_chunks": empty_chunks,
+                    "short_chunks": short_chunks,
+                    "short_threshold": short_threshold,
+                }
+                if empty_chunks > 0 or short_chunks > 0:
+                    recorder.push(
+                        "CHUNKING_QUALITY",
+                        "WARN",
+                        f"Detectados {empty_chunks} chunks vacíos y {short_chunks} chunks cortos (<{short_threshold} chars).",
+                        chunk_summary,
+                    )
                 recorder.push(
                     "CHUNKING",
                     "OK",
                     "Chunking completado.",
-                    {"strategy": chunking_method, "chunks_count": len(chunks)},
+                    chunk_summary,
                 )
                 update_job_progress(db, job_id, recorder, "RUNNING", "CHUNKING")
             else:
@@ -3237,19 +3600,18 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                         documento_id=documento_id,
                         metadata_patch=metadata_patch,
                         updated_by=ocr_updated_by,
-                        estado="PROCESADO",
                     )
                     if document_finalize_info is None:
                         raise PipelineError(
                             "DOCUMENT_FINALIZE",
                             "DOCUMENT_NOT_UPDATED",
-                            "No fue posible marcar documento como PROCESADO al finalizar embeddings/chunking.",
+                            "No fue posible actualizar metadatosExtra al finalizar embeddings/chunking.",
                             {"documento_id": documento_id, "service_endpoint": service_endpoint},
                         )
                     recorder.push(
                         "DOCUMENT_FINALIZE",
                         "OK",
-                        "Documento actualizado: embeddingGenerado=true, estado=PROCESADO, metadatosExtra actualizado.",
+                        "metadatosExtra actualizado. Flags (embeddingGenerado, estado) los gestiona el consumer.",
                         {
                             "documento_id": documento_id,
                             "estado_documento": safe_str(document_finalize_info.get("estado_documento"), ""),
@@ -3304,6 +3666,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 "ocr_document_update": to_json_safe(ocr_update_info or {}),
                 "document_finalize_update": to_json_safe(document_finalize_info or {}),
                 "chunks_count": len(chunks),
+                "chunks_summary": to_json_safe(chunk_summary) if chunk_summary else None,
                 "inserted_rows": inserted_rows,
                 "gpu": gpu_metrics(),
                 "elapsed_ms": elapsed_ms,
@@ -3352,6 +3715,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             "code": exc.code,
             "message": exc.message,
             "details": error_details,
+            "retryable": exc.retryable,
         }
         if job_id is not None:
             try:
@@ -3556,8 +3920,117 @@ def health(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
     }
 
 
+@app.get("/health/dependencies", tags=[TAG_HELPERS])
+def health_dependencies(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """Verifica dependencias externas del servicio."""
+    import shutil
+
+    # --- LibreOffice ---
+    lo_cmd = shutil.which("libreoffice") or shutil.which("soffice")
+    if not lo_cmd:
+        for candidate in [
+            r"C:\Program Files\LibreOffice\program\soffice.exe",
+            r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+            "/usr/bin/libreoffice",
+            "/usr/bin/soffice",
+            "/usr/local/bin/libreoffice",
+            "/usr/local/bin/soffice",
+            "/snap/bin/libreoffice",
+        ]:
+            if os.path.isfile(candidate):
+                lo_cmd = candidate
+                break
+
+    lo_version = None
+    if lo_cmd:
+        try:
+            import subprocess
+            proc = subprocess.run(
+                [lo_cmd, "--version"], capture_output=True, text=True, timeout=10,
+            )
+            lo_version = proc.stdout.strip() or proc.stderr.strip() or "desconocida"
+        except Exception as exc:
+            lo_version = f"error: {exc}"
+
+    # --- PostgreSQL ---
+    pg_ok = False
+    pg_error = None
+    try:
+        with PostgresClient(PostgresSettings.from_env()) as db:
+            db.execute_returning_one("SELECT 1", ())
+            pg_ok = True
+    except Exception as exc:
+        pg_error = str(exc)[:200]
+
+    # --- GPU / CUDA ---
+    gpu_info = gpu_metrics()
+
+    # --- Docling ---
+    docling_version = None
+    try:
+        import docling
+        docling_version = getattr(docling, "__version__", "instalado")
+    except ImportError:
+        docling_version = "NO INSTALADO"
+
+    # --- Transformers (embeddings) ---
+    transformers_version = None
+    try:
+        import transformers
+        transformers_version = getattr(transformers, "__version__", "instalado")
+    except ImportError:
+        transformers_version = "NO INSTALADO"
+
+    # --- PyTorch ---
+    torch_info = {
+        "instalado": torch.cuda.is_available() or True,
+        "version": getattr(torch, "__version__", "desconocida"),
+        "cuda": torch.cuda.is_available(),
+    }
+
+    deps = {
+        "libreoffice": {
+            "instalado": lo_cmd is not None,
+            "ruta": lo_cmd,
+            "version": lo_version,
+            "formatos_legacy_soportados": [".doc", ".xls", ".ppt"] if lo_cmd else [],
+            "nota": None if lo_cmd else "Archivos .doc/.xls/.ppt seran etiquetados como 'Formato no soportado'",
+        },
+        "postgresql": {
+            "conectado": pg_ok,
+            "error": pg_error,
+        },
+        "gpu": gpu_info,
+        "docling": {
+            "instalado": docling_version != "NO INSTALADO",
+            "version": docling_version,
+        },
+        "transformers": {
+            "instalado": transformers_version != "NO INSTALADO",
+            "version": transformers_version,
+        },
+        "torch": torch_info,
+    }
+
+    all_ok = all([
+        lo_cmd is not None,
+        pg_ok,
+        gpu_info.get("cuda_available", False),
+        docling_version != "NO INSTALADO",
+        transformers_version != "NO INSTALADO",
+    ])
+
+    return {
+        "status": "ok" if all_ok else "degraded",
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "timestamp_utc": utc_now_iso(),
+        "dependencies": deps,
+    }
+
+
 @app.get("/example-request", tags=[TAG_HELPERS])
-def example_request(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:    
+def example_request(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
     """Returns request payload example."""
     return {"input": sample_request()}
 
@@ -4257,6 +4730,7 @@ async def validate_pipeline_upload(
                 "MIME_VALIDATION", "UNSUPPORTED_MIME_TYPE",
                 f"Mime type '{mime_type}' no soportado.",
                 {"supported": sorted(SUPPORTED_DOCLING_MIME_TYPES)},
+                retryable=False,
             )
         recorder.push("MIME_VALIDATION", "OK", "Mime type soportado.", {"mime_type": mime_type})
 
@@ -4444,18 +4918,23 @@ async def validate_pipeline_upload(
         }))
 
 
+def _raise_pipeline_error(detail: Dict[str, Any]) -> None:
+    """Lanza HTTP 422 con detalle estructurado para errores de pipeline (no auth)."""
+    raise HTTPException(status_code=422, detail=to_json_safe(detail))
+
+
 def _raise_forbidden(detail: Dict[str, Any]) -> None:
     """Lanza HTTP 403 con detalle estructurado y serializable."""
     raise HTTPException(status_code=403, detail=to_json_safe(detail))
 
 
 def _run_single_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingResponse:
-    """Ejecuta una solicitud single-stage y eleva 403 con detalle completo si falla."""
+    """Ejecuta una solicitud single-stage y eleva 422 con detalle completo si falla."""
     input_payload = payload.get("input", payload)
     try:
         request = OCRChunkingRequest(**input_payload)
     except Exception as exc:
-        _raise_forbidden(
+        _raise_pipeline_error(
             {
                 "status": "FAILED",
                 "exitoso": False,
@@ -4473,7 +4952,7 @@ def _run_single_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunking
 
     response = process_request(request, stage=stage)
     if not response.exitoso:
-        _raise_forbidden(
+        _raise_pipeline_error(
             {
                 "status": response.status,
                 "exitoso": response.exitoso,
@@ -4493,7 +4972,7 @@ def _run_batch_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingB
     try:
         request = OCRChunkingBatchRequest(**input_payload)
     except Exception as exc:
-        _raise_forbidden(
+        _raise_pipeline_error(
             {
                 "status": "FAILED",
                 "exitoso": False,
@@ -4511,7 +4990,7 @@ def _run_batch_stage_or_403(payload: Dict[str, Any], stage: str) -> OCRChunkingB
 
     response = process_batch(request, stage=stage)
     if not response.exitoso:
-        _raise_forbidden(
+        _raise_pipeline_error(
             {
                 "status": response.status,
                 "exitoso": response.exitoso,
