@@ -115,6 +115,8 @@ SUPPORTED_DOCLING_MIME_TYPES = {
     "application/msword",
     "application/vnd.ms-excel",
     "application/vnd.ms-powerpoint",
+    # Texto plano
+    "text/plain",
     # Markup / text
     "text/markdown",
     "text/x-markdown",
@@ -125,6 +127,13 @@ SUPPORTED_DOCLING_MIME_TYPES = {
     "text/html",
     "application/xhtml+xml",
     "text/csv",
+    # XML especializados (Docling soporta USPTO, JATS, XBRL)
+    "application/xml",
+    "text/xml",
+    "application/vnd.webvtt",
+    "text/vtt",
+    # Docling JSON
+    "application/json",
     # Images
     "image/png",
     "image/jpeg",
