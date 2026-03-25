@@ -63,7 +63,7 @@ from transformers import AutoModel, AutoTokenizer
 
 
 SERVICE_NAME = "OCR Chunking Embeddings Orchestrator"
-SERVICE_VERSION = "3.0.0-20260323"
+SERVICE_VERSION = "3.1.0-20260325"
 TAG_CHUNKING = "Segmento Chunking"
 TAG_EMBEDDING = "Segmento Embedding"
 TAG_OCR = "Segmento Docling-OCR"
@@ -285,17 +285,42 @@ def estimate_document_timeout(mime_type: str, pages: int = 1, size_bytes: int = 
 
     El consumer usa esta funcion para decidir la composicion del batch
     y evitar exceder el timeout global.
-    Formula: base_por_formato * paginas + embeddings_base + penalizacion_tamano
+    Formula adaptativa por tamano y formato:
+      - Archivos < 100KB: timeout reducido (no justifica espera larga)
+      - Archivos 100KB-1MB: timeout estandar
+      - Archivos > 1MB: timeout extendido
+      - Legacy (.doc/.xls/.ppt): penalizacion por conversion LibreOffice
     """
-    base = TIMEOUT_PER_FORMAT.get(normalize_mime_type(mime_type), 5.0)
-    # PDFs: escala por paginas. Otros: base fija.
-    if "pdf" in (mime_type or "").lower():
+    mime = normalize_mime_type(mime_type)
+    base = TIMEOUT_PER_FORMAT.get(mime, 5.0)
+    is_legacy = mime in (
+        "application/msword", "application/vnd.ms-excel", "application/vnd.ms-powerpoint"
+    )
+    is_text = mime in ("text/plain", "text/csv", "text/html", "application/json", "application/xml")
+
+    # Fast-path: texto plano y archivos pequenos no necesitan mucho tiempo
+    if is_text:
+        return max(5.0, min(base + TIMEOUT_EMBEDDINGS_BASE, 30.0))
+
+    # PDFs: escala por paginas
+    if "pdf" in (mime or ""):
         estimated = base * max(pages, 1) + TIMEOUT_EMBEDDINGS_BASE
     else:
         estimated = base + TIMEOUT_EMBEDDINGS_BASE
-    # Penalizacion por tamano: archivos >50MB reciben tiempo extra
-    if size_bytes > 50_000_000:
-        estimated += (size_bytes / 50_000_000) * 30.0
+
+    # Timeout adaptativo por tamano del archivo
+    if size_bytes > 0:
+        if size_bytes < 100_000:  # < 100KB
+            estimated = min(estimated, 60.0 if is_legacy else 30.0)
+        elif size_bytes < 1_000_000:  # 100KB - 1MB
+            estimated = min(estimated, 120.0 if is_legacy else 60.0)
+        elif size_bytes > 50_000_000:  # > 50MB
+            estimated += (size_bytes / 50_000_000) * 30.0
+    else:
+        # Sin tamano conocido: penalizacion por tamano desconocido en legacy
+        if is_legacy:
+            estimated += 30.0
+
     return estimated
 
 
@@ -2226,7 +2251,16 @@ def _convert_legacy_office(binary_bytes: bytes, source_ext: str, target_format: 
             "--outdir", tmpdir,
             src_path,
         ]
-        proc = subprocess.run(cmd, capture_output=True, timeout=120, text=True)
+        # Timeout adaptativo por tamano: archivos pequenos no deben esperar 120s
+        _lo_timeout = 120  # default
+        _file_size = len(binary_bytes)
+        if _file_size < 100_000:       # < 100KB
+            _lo_timeout = 30
+        elif _file_size < 500_000:     # < 500KB
+            _lo_timeout = 60
+        elif _file_size < 5_000_000:   # < 5MB
+            _lo_timeout = 90
+        proc = subprocess.run(cmd, capture_output=True, timeout=_lo_timeout, text=True)
         if proc.returncode != 0:
             raise PipelineError(
                 "LEGACY_CONVERSION", "LIBREOFFICE_FAILED",
@@ -3323,7 +3357,36 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
                 engine = "docling"
 
             extraction_meta: Dict[str, Any] = {"engine": engine, "mime_type": mime_type}
-            if engine == "pymupdf":
+
+            # --- E2: Fast-path para texto plano ---
+            # Archivos text/plain, CSV, HTML y JSON se leen directamente sin Docling/OCR.
+            # Esto reduce de ~30s a <1s para archivos de texto puro.
+            _fast_path_mimes = {
+                "text/plain", "text/csv", "application/json", "application/xml",
+                "text/markdown", "text/x-markdown",
+            }
+            if mime_type in _fast_path_mimes:
+                _encodings = ["utf-8", "latin-1", "cp1252", "iso-8859-1"]
+                extracted_text = ""
+                for _enc in _encodings:
+                    try:
+                        extracted_text = selected_binary.decode(_enc)
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                extracted_pages = 1
+                engine = "fast_path_text"
+                extraction_meta.update({
+                    "engine": engine,
+                    "encoding_detected": _enc,
+                    "ocr_quality": 1.0,
+                    "chars": len(extracted_text),
+                    "pages_processed": 1,
+                })
+                recorder.push("TEXT_EXTRACTION", "OK",
+                    f"Fast-path texto plano: {len(extracted_text)} chars, encoding={_enc}.",
+                    {"engine": engine, "chars": len(extracted_text)})
+            elif engine == "pymupdf":
                 extracted_text, extracted_pages = extract_text_pymupdf(selected_binary)
                 extraction_meta["ocr_confidence"] = {
                     "source": "pymupdf_probe",
