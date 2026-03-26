@@ -357,6 +357,32 @@ _DOCLING_CONVERTER_CACHE: Dict[str, Any] = {}
 _MODEL_LOCK = Lock()
 _TOKENIZER_LOCK = Lock()
 _DOCLING_LOCK = Lock()
+
+# ---------------------------------------------------------------------------
+# Multi-GPU round-robin dispatcher
+# Distributes work across all available CUDA devices.
+# Thread-safe counter for round-robin GPU assignment.
+# ---------------------------------------------------------------------------
+import itertools as _itertools
+
+_GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
+_GPU_COUNTER = _itertools.count()
+_GPU_LOCK = Lock()
+
+def _next_gpu_device() -> str:
+    """Returns the next GPU device in round-robin order (e.g., 'cuda:0', 'cuda:1', 'cuda:2').
+    Falls back to 'cpu' if no CUDA devices available."""
+    if _GPU_COUNT == 0:
+        return "cpu"
+    with _GPU_LOCK:
+        idx = next(_GPU_COUNTER) % _GPU_COUNT
+    return f"cuda:{idx}"
+
+def _get_gpu_device_for_request() -> str:
+    """Returns a GPU device string for a new request. Thread-safe round-robin."""
+    return _next_gpu_device()
+
+LOGGER.info(f"Multi-GPU dispatcher initialized: {_GPU_COUNT} GPUs available.")
 _JWK_CLIENT: Optional[PyJWKClient] = None
 _AUTH_SETTINGS_CACHE: Optional["AuthSettings"] = None
 _PG_SETTINGS_CACHE: Optional["PostgresSettings"] = None
@@ -1910,29 +1936,40 @@ def load_tokenizer(model_name: str) -> Any:
         return tokenizer
 
 
-def load_embedding_model(model_name: str) -> Tuple[Any, Any, str]:
-    """Loads tokenizer/model/device with in-memory cache.
+def load_embedding_model(model_name: str, target_device: str = None) -> Tuple[Any, Any, str]:
+    """Loads tokenizer/model/device with in-memory cache (per device).
 
     Uses float16 on CUDA to halve VRAM usage (sufficient for embedding inference).
+    Supports multi-GPU: each device gets its own model copy, keyed by model_name + device.
     """
+    device = target_device or ("cuda" if torch.cuda.is_available() else "cpu")
+    cache_key = f"{model_name}@{device}"
     with _MODEL_LOCK:
-        cached = _MODEL_CACHE.get(model_name)
+        cached = _MODEL_CACHE.get(cache_key)
         if cached is not None:
             return cached
         tokenizer = AutoTokenizer.from_pretrained(model_name)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        dtype = torch.float16 if device == "cuda" else torch.float32
+        dtype = torch.float16 if "cuda" in device else torch.float32
         model = AutoModel.from_pretrained(model_name, dtype=dtype)
         model = model.to(device)
         model.eval()
-        _MODEL_CACHE[model_name] = (tokenizer, model, device)
+        _MODEL_CACHE[cache_key] = (tokenizer, model, device)
+        LOGGER.info(f"Embedding model '{model_name}' loaded on {device} (VRAM: {torch.cuda.memory_allocated(device) / 1e9:.1f} GB)" if "cuda" in device else f"Embedding model '{model_name}' loaded on CPU")
         return tokenizer, model, device
 
 
-def _build_accelerator_options() -> AcceleratorOptions:
-    """Builds AcceleratorOptions: CUDA if available, else CPU."""
-    device = AcceleratorDevice.CUDA if torch.cuda.is_available() else AcceleratorDevice.CPU
-    return AcceleratorOptions(device=device)
+def _build_accelerator_options(target_device: str = None) -> AcceleratorOptions:
+    """Builds AcceleratorOptions with specific CUDA device support.
+
+    Docling AcceleratorOptions accepts device as string: 'cuda:0', 'cuda:1', etc.
+    See: https://github.com/docling-project/docling/issues/2292
+    """
+    if target_device and "cuda" in target_device:
+        # Pass device string directly — Docling supports 'cuda:N' format
+        return AcceleratorOptions(device=target_device, num_threads=8)
+    if torch.cuda.is_available():
+        return AcceleratorOptions(device="cuda", num_threads=8)
+    return AcceleratorOptions(device="cpu", num_threads=4)
 
 
 def load_docling_converter(force_full_page_ocr: bool, do_table_structure: bool, images_scale: float) -> Any:
@@ -1942,15 +1979,24 @@ def load_docling_converter(force_full_page_ocr: bool, do_table_structure: bool, 
     AcceleratorOptions for layout/table models, and tuned batch sizes.
     See: https://docling-project.github.io/docling/usage/gpu/
     """
-    key = f"{int(force_full_page_ocr)}|{int(do_table_structure)}|{images_scale:.3f}"
+    # Cache key includes GPU device to avoid sharing converters across GPUs.
+    # Each GPU gets its own converter instance with models on that specific device.
+    # Docling AcceleratorOptions accepts 'cuda:N' directly (no need for torch.cuda.set_device).
+    _current_device = "cpu"
+    use_gpu = torch.cuda.is_available()
+    if use_gpu and _GPU_COUNT > 1:
+        _current_device = f"cuda:{torch.cuda.current_device()}"
+    elif use_gpu:
+        _current_device = "cuda:0"
+
+    key = f"{int(force_full_page_ocr)}|{int(do_table_structure)}|{images_scale:.3f}|{_current_device}"
     with _DOCLING_LOCK:
         cached = _DOCLING_CONVERTER_CACHE.get(key)
         if cached is not None:
             return cached
 
-        use_gpu = torch.cuda.is_available()
+        LOGGER.info(f"Creating Docling converter on {_current_device} (key={key})")
 
-        # RapidOCR with torch backend is the only known working GPU OCR setup.
         ocr_options = RapidOcrOptions(
             backend="torch" if use_gpu else "onnxruntime",
             force_full_page_ocr=bool(force_full_page_ocr),
@@ -1963,12 +2009,11 @@ def load_docling_converter(force_full_page_ocr: bool, do_table_structure: bool, 
             generate_page_images=False,
             generate_picture_images=False,
             ocr_options=ocr_options,
-            accelerator_options=_build_accelerator_options(),
+            accelerator_options=_build_accelerator_options(_current_device),
             document_timeout=PAGE_CHUNK_DOCUMENT_TIMEOUT if PAGE_CHUNK_DOCUMENT_TIMEOUT > 0 else None,
-            # Batch sizes: increase for GPU, keep low for CPU.
             ocr_batch_size=64 if use_gpu else 4,
             layout_batch_size=64 if use_gpu else 4,
-            table_batch_size=4,
+            table_batch_size=8 if use_gpu else 4,
         )
 
         converter = DocumentConverter(
@@ -2912,6 +2957,17 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
     run_embedding_stage = stage_key in {"embedding", "pipeline"} and request.embedding.enabled
     run_persist_stage = stage_key in {"embedding", "pipeline"} and request.embedding.save_to_db
 
+    # Multi-GPU: assign a GPU device for this request (round-robin).
+    # MUST be set BEFORE any model loading or converter creation.
+    _request_device = _get_gpu_device_for_request()
+    _dev_idx = 0
+    if "cuda" in _request_device and _GPU_COUNT > 1:
+        try:
+            _dev_idx = int(_request_device.split(":")[1])
+            torch.cuda.set_device(_dev_idx)
+        except Exception:
+            pass
+
     started = time.monotonic()
     recorder = PhaseRecorder()
     queue_slot_acquired = False
@@ -3617,7 +3673,7 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
             tokens_per_chunk: List[int] = [0 for _ in chunks]
             embedding_device = "none"
             if run_embedding_stage:
-                tokenizer, model, device = load_embedding_model(request.embedding.model_name)
+                tokenizer, model, device = load_embedding_model(request.embedding.model_name, target_device=_request_device)
                 derived_max_length = derive_embedding_max_length(request.chunking)
                 vectors, tokens_per_chunk = embed_chunks(
                     chunks=chunks,
@@ -5073,7 +5129,7 @@ async def validate_pipeline_upload(
 
         # --- Phase 7: Embeddings (GPU) ---
         phase_start = time.monotonic()
-        tokenizer, model, device = load_embedding_model(embedding_model)
+        tokenizer, model, device = load_embedding_model(embedding_model, target_device=_get_gpu_device_for_request())
         derived_max_length = derive_embedding_max_length(chunking_opts)
         vectors, tokens_per_chunk = embed_chunks(
             chunks=chunks, tokenizer=tokenizer, model=model,

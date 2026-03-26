@@ -61,6 +61,32 @@ class FakeDB:
     def insert_embeddings(self, rows):
         return len(rows)
 
+    def fetch_large_object_stats(self, oid: int):
+        return {"oid": oid, "paginas": 1, "bytes_aprox": 2048}
+
+    def fetch_documento_by_metadata_oid(self, oid: int):
+        return {"id": 1, "titulo": "Demo", "archivoNombre": "demo_contrato.pdf",
+                "contenidoTexto": None, "contenidoHash": None, "estado": "EN_PROCESAMIENTO",
+                "faseActual": "Ingesta"}
+
+    def fetch_documento_by_file_name(self, file_name: str):
+        return self.fetch_documento_by_metadata_oid(0)
+
+    def mark_documento_pending_processing(self, **kwargs):
+        return None
+
+    def count_processed_documents_by_hash(self, **kwargs):
+        return {"total": 0}
+
+    def update_documento_ocr_text(self, **kwargs):
+        return {"id": 1, "updated": True}
+
+    def update_documento_embedding_completion(self, **kwargs):
+        return {"id": 1, "updated": True}
+
+    def execute_returning_one(self, sql, params):
+        return {"result": 1}
+
     def get_job(self, job_id: int):
         return None
 
