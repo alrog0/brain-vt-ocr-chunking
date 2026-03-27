@@ -368,6 +368,11 @@ import itertools as _itertools
 _GPU_COUNT = torch.cuda.device_count() if torch.cuda.is_available() else 0
 _GPU_COUNTER = _itertools.count()
 _GPU_LOCK = Lock()
+# Per-GPU stats: requests processed, total time, errors
+_GPU_STATS: Dict[str, Dict[str, Any]] = {
+    f"cuda:{i}": {"requests": 0, "total_ms": 0, "errors": 0, "last_used": None}
+    for i in range(_GPU_COUNT)
+} if _GPU_COUNT > 0 else {}
 
 def _next_gpu_device() -> str:
     """Returns the next GPU device in round-robin order (e.g., 'cuda:0', 'cuda:1', 'cuda:2').
@@ -381,6 +386,31 @@ def _next_gpu_device() -> str:
 def _get_gpu_device_for_request() -> str:
     """Returns a GPU device string for a new request. Thread-safe round-robin."""
     return _next_gpu_device()
+
+def _record_gpu_usage(device: str, elapsed_ms: int, error: bool = False):
+    """Records usage stats for a GPU device."""
+    if device in _GPU_STATS:
+        with _GPU_LOCK:
+            _GPU_STATS[device]["requests"] += 1
+            _GPU_STATS[device]["total_ms"] += elapsed_ms
+            if error:
+                _GPU_STATS[device]["errors"] += 1
+            _GPU_STATS[device]["last_used"] = utc_now_iso()
+
+def get_gpu_stats() -> Dict[str, Any]:
+    """Returns per-GPU usage statistics."""
+    with _GPU_LOCK:
+        stats = {}
+        for dev, s in _GPU_STATS.items():
+            avg_ms = round(s["total_ms"] / s["requests"]) if s["requests"] > 0 else 0
+            stats[dev] = {
+                "requests": s["requests"],
+                "avg_ms": avg_ms,
+                "total_ms": s["total_ms"],
+                "errors": s["errors"],
+                "last_used": s["last_used"],
+            }
+        return {"gpu_count": _GPU_COUNT, "devices": stats}
 
 LOGGER.info(f"Multi-GPU dispatcher initialized: {_GPU_COUNT} GPUs available.")
 _JWK_CLIENT: Optional[PyJWKClient] = None
@@ -4084,6 +4114,14 @@ def run_real_pipeline(request: OCRChunkingRequest, stage: str = "pipeline") -> O
         )
 
     finally:
+        # Registrar stats por GPU
+        try:
+            _elapsed_total = int((time.monotonic() - started) * 1000)
+            _has_error = any(p.get("status") == "ERROR" for p in recorder.as_list())
+            _record_gpu_usage(_request_device, _elapsed_total, error=_has_error)
+        except Exception:
+            pass
+
         # Liberar memoria GPU/CPU despues de cada ejecucion del pipeline
         try:
             import gc
@@ -4510,6 +4548,25 @@ def validate_gpu(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str,
         "devices": devices,
     })
     return result
+
+
+@app.get("/gpu-stats", tags=[TAG_INFRA])
+def gpu_stats_endpoint(_: Dict[str, Any] = Depends(require_service_auth)) -> Dict[str, Any]:
+    """Returns per-GPU usage statistics: requests, avg latency, errors."""
+    stats = get_gpu_stats()
+    # Add real-time memory info per GPU
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            dev_key = f"cuda:{i}"
+            if dev_key in stats.get("devices", {}):
+                props = torch.cuda.get_device_properties(i)
+                stats["devices"][dev_key]["memory"] = {
+                    "total_gb": round(props.total_memory / 1e9, 1),
+                    "allocated_gb": round(torch.cuda.memory_allocated(i) / 1e9, 2),
+                    "reserved_gb": round(torch.cuda.memory_reserved(i) / 1e9, 2),
+                    "free_gb": round((props.total_memory - torch.cuda.memory_reserved(i)) / 1e9, 2),
+                }
+    return stats
 
 
 @app.get("/validate-libraries", tags=[TAG_INFRA])
