@@ -4,6 +4,28 @@ Servicio OpenAPI (FastAPI) que orquesta **OCR, chunking semántico y generación
 
 ---
 
+## Flujo de trabajo y gobernanza
+
+| Rama | Propósito |
+|---|---|
+| `main` | Rama estable y de release — solo recibe cambios desde `develop` vía PR |
+| `develop` | Rama de integración de trabajo diario |
+
+### Convención de ramas
+
+- `feature/<alcance>` para nuevas capacidades
+- `fix/<alcance>` para correcciones normales  
+- `hotfix/<alcance>` para correcciones urgentes con destino directo a main
+
+### Flujo recomendado
+
+1. Crear rama desde `develop`.
+2. Abrir PR hacia `develop` para cambios normales.
+3. Cuando `develop` esté estable, promover hacia `main` con PR.
+4. Ramas temporales se borran automáticamente tras merge.
+
+---
+
 ## Tabla de contenidos
 
 1. [Arquitectura general](#arquitectura-general)
