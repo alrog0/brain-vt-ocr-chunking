@@ -1449,7 +1449,7 @@ class PostgresClient:
         VALUES (%s,%s,%s,%s,%s,%s,0,0,true,(CURRENT_TIMESTAMP AT TIME ZONE 'America/Bogota'))
         ON CONFLICT ("nombre") DO UPDATE
         SET "descripcion" = COALESCE(EXCLUDED."descripcion","Operaciones"."ColasProcesamiento"."descripcion"),
-            "maxConcurrencia" = EXCLUDED."maxConcurrencia",
+            "maxConcurrencia" = GREATEST(EXCLUDED."maxConcurrencia", "Operaciones"."ColasProcesamiento"."maxConcurrencia"),
             "prioridadDefault" = EXCLUDED."prioridadDefault",
             "timeoutSegundos" = EXCLUDED."timeoutSegundos",
             "reintentosMax" = EXCLUDED."reintentosMax",
@@ -1723,7 +1723,7 @@ class QueueOptions(BaseModel):
     """Queue options."""
 
     enabled: bool = Field(default=True, description="Enable queue controls.")
-    max_concurrency: int = Field(default=2, ge=1, le=64)
+    max_concurrency: int = Field(default=9, ge=1, le=64)
     queue_when_busy: bool = Field(
         default=True,
         description="Si la cola esta ocupada, crea job PENDIENTE (ENQUEUED) en lugar de fallar.",
