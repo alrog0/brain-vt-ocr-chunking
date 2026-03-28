@@ -2788,7 +2788,7 @@ def embed_chunks(
     tokens_per_chunk: List[int] = []
     step = max(1, int(batch_size))
 
-    use_amp = device == "cuda"
+    is_cuda = "cuda" in device  # Soporta cuda, cuda:0, cuda:1, cuda:2
     for idx in range(0, len(chunks), step):
         batch_text = chunks[idx : idx + step]
         encoded = tokenizer(
@@ -2799,11 +2799,11 @@ def embed_chunks(
             max_length=max(16, int(max_length)),
         )
         attention_mask = encoded["attention_mask"]
-        if device == "cuda":
+        if is_cuda:
             encoded = {k: v.to(device) for k, v in encoded.items()}
             attention_mask = attention_mask.to(device)
         with torch.inference_mode():
-            if use_amp:
+            if is_cuda:
                 with torch.amp.autocast("cuda"):
                     model_output = model(**encoded)
             else:
